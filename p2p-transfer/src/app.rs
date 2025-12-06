@@ -45,7 +45,7 @@ pub struct P2PTransfer {
     #[serde(skip)]
     shared_node_id: std::sync::Arc<std::sync::Mutex<Option<NodeId>>>,
     #[serde(skip)]
-    is_receiving: bool,
+    is_receiving: std::sync::Arc<std::sync::Mutex<bool>>,
     #[serde(skip)]
     show_receive_dialog: bool,
     #[serde(skip)]
@@ -75,7 +75,7 @@ impl Default for P2PTransfer {
             is_accepting: false,
             connect_command: String::new(),
             shared_node_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            is_receiving: false,
+            is_receiving: std::sync::Arc::new(std::sync::Mutex::new(false)),
             show_receive_dialog: false,
             receive_hash_input: String::new(),
             receive_status: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
@@ -294,11 +294,15 @@ impl P2PTransfer {
     }
 
     fn start_receiving(&mut self, ctx: &egui::Context, target_node_id: NodeId) {
-        if self.is_receiving {
-            return;
+        if let Ok(is_recv) = self.is_receiving.lock() {
+            if *is_recv {
+                return;
+            }
         }
 
-        self.is_receiving = true;
+        if let Ok(mut is_recv) = self.is_receiving.lock() {
+            *is_recv = true;
+        }
         if let Ok(mut status) = self.receive_status.lock() {
             *status = "Connecting...".to_string();
         }
@@ -310,6 +314,7 @@ impl P2PTransfer {
             let ctx_clone = ctx.clone();
             let node_shared = self.node.clone();
             let status_shared = self.receive_status.clone();
+            let is_receiving_shared = self.is_receiving.clone();
 
             spawn_local(async move {
                 match EchoNode::spawn().await {
@@ -335,6 +340,10 @@ impl P2PTransfer {
                         if let Ok(mut status) = status_shared.lock() {
                             *status = format!("Connection failed: {}", e);
                         }
+                        if let Ok(mut is_recv) = is_receiving_shared.lock() {
+                            *is_recv = false;
+                        }
+                        ctx_clone.request_repaint();
                     }
                 }
             });
@@ -346,6 +355,7 @@ impl P2PTransfer {
             let node_shared = self.node.clone();
             let status_shared = self.receive_status.clone();
             let logs_shared = self.terminal_logs.clone();
+            let is_receiving_shared = self.is_receiving.clone();
 
             tokio::spawn(async move {
                 match EchoNode::spawn().await {
@@ -430,10 +440,19 @@ impl P2PTransfer {
                         ctx_clone.request_repaint();
                     }
                     Err(e) => {
-                        println!("Failed to connect: {}", e);
+                        let log_msg = format!("✗ Failed to connect: {}", e);
+                        println!("{}", log_msg);
+
+                        if let Ok(mut logs) = logs_shared.lock() {
+                            logs.push(log_msg);
+                        }
                         if let Ok(mut status) = status_shared.lock() {
                             *status = format!("Connection failed: {}", e);
                         }
+                        if let Ok(mut is_recv) = is_receiving_shared.lock() {
+                            *is_recv = false;
+                        }
+                        ctx_clone.request_repaint();
                     }
                 }
             });
@@ -441,7 +460,9 @@ impl P2PTransfer {
     }
 
     fn stop_receiving(&mut self) {
-        self.is_receiving = false;
+        if let Ok(mut is_recv) = self.is_receiving.lock() {
+            *is_recv = false;
+        }
         self.show_receive_dialog = false;
 
         if let Ok(mut status) = self.receive_status.lock() {
@@ -738,7 +759,8 @@ impl eframe::App for P2PTransfer {
                             }
 
                             ui.horizontal(|ui| {
-                                if !self.is_receiving {
+                                let is_receiving = self.is_receiving.lock().map(|r| *r).unwrap_or(false);
+                                if !is_receiving {
                                     if ui.button("Connect").clicked() {
                                         if let Ok(node_id) = self.receive_hash_input.parse::<NodeId>() {
                                             self.start_receiving(ctx, node_id);
