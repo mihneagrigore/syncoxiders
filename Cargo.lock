@@ -3173,6 +3173,7 @@ checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 [[package]]
 name = "iroh"
 version = "0.91.2"
+source = "git+https://github.com/anchalshivank/iroh?branch=feature%2Fwebrtc-wasm-support#4540a68b5660e03e5474934b6d50601f7c60cfa9"
 dependencies = [
  "aead",
  "backon",
@@ -3237,6 +3238,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "0.91.2"
+source = "git+https://github.com/anchalshivank/iroh?branch=feature%2Fwebrtc-wasm-support#4540a68b5660e03e5474934b6d50601f7c60cfa9"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -3333,6 +3335,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "0.91.2"
+source = "git+https://github.com/anchalshivank/iroh?branch=feature%2Fwebrtc-wasm-support#4540a68b5660e03e5474934b6d50601f7c60cfa9"
 dependencies = [
  "blake3",
  "bytes",
@@ -3820,6 +3823,7 @@ dependencies = [
 [[package]]
 name = "n0-watcher"
 version = "0.4.0"
+source = "git+https://github.com/anchalshivank/n0-watcher?branch=feature%2Fwebrtc-wasm-support#b7d9a26abaf8a6401c89fd57b6360dd0f0ccce14"
 dependencies = [
  "derive_more 2.1.0",
  "n0-future 0.3.1",
@@ -3999,6 +4003,7 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.8.0"
+source = "git+https://github.com/anchalshivank/net-tools?branch=main#b1e02baeeddc77ffa37f09083d0f512a2e97e338"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -4928,6 +4933,7 @@ dependencies = [
 [[package]]
 name = "portmapper"
 version = "0.8.0"
+source = "git+https://github.com/anchalshivank/net-tools?branch=main#b1e02baeeddc77ffa37f09083d0f512a2e97e338"
 dependencies = [
  "base64 0.22.1",
  "bytes",

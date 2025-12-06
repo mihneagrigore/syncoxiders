@@ -40,7 +40,7 @@ console_error_panic_hook = "0.1.7"
 tokio = "1.45.0"
 js-sys = "0.3.77"
 wasm-bindgen-futures = "0.4.50"
-iroh = { path = "../../iroh/iroh", default-features = false }
+iroh = { git = "https://github.com/anchalshivank/iroh", branch = "feature/webrtc-wasm-support", default-features = false }
 n0-future = "0.1.3"
 
 # Fix for getrandom WASM support
@@ -66,6 +66,9 @@ opt-level = 2
 
 
 [patch.crates-io]
+n0-watcher = { git = "https://github.com/anchalshivank/n0-watcher", branch = "feature/webrtc-wasm-support" }
+netwatch = { git = "https://github.com/anchalshivank/net-tools", branch = "main" }
+portmapper = { git = "https://github.com/anchalshivank/net-tools", branch = "main" }
 
 # If you want to use the bleeding edge version of egui and eframe:
 # egui = { git = "https://github.com/emilk/egui", branch = "master" }
