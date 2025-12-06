@@ -1,6 +1,6 @@
 use iroh::endpoint::{Accept, Connection};
-use iroh::{Endpoint, NodeId};
-use iroh::protocol::{ProtocolHandler, Router};
+use iroh::{Endpoint, NodeId, TransportMode};
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use tokio::sync::broadcast;
 use anyhow::Result;
 use async_channel::Sender;
@@ -18,7 +18,11 @@ pub struct EchoNode{
 impl EchoNode {
     pub async fn spawn() -> Result<Self> {
 
-        let endpoint = Endpoint::builder().discovery_n0().alpns(vec![Echo::ALPN.to_vec()]).bind().await?;
+        let endpoint = Endpoint::builder()
+            .discovery_n0()
+            .alpns(vec![Echo::ALPN.to_vec()])
+            .bind_transport(TransportMode::WebrtcRelay)
+            .await?;
         let (event_sender, _event_receiver) = broadcast::channel(128);
         let echo = Echo::new(event_sender.clone());
         let router = Router::builder(endpoint)
@@ -91,7 +95,7 @@ impl Echo{
 }
 
 impl Echo {
-    async fn handle_connection(self, connection: Connection) -> Result<()> {
+    async fn handle_connection(self, connection: Connection) -> std::result::Result<(), AcceptError> {
 
         let node_id  = connection.remote_node_id()?;
         self.event_sender.send(AcceptEvent::Accepted {node_id }).ok();
@@ -103,7 +107,7 @@ impl Echo {
 
     }
 
-    async fn handle_connection_0(&self, connection: &Connection) -> Result<()> {
+    async fn handle_connection_0(&self, connection: &Connection) -> std::result::Result<(), AcceptError> {
 
         let node_id = connection.remote_node_id()?;
         info!("Accepted connection from {}", node_id);
@@ -126,7 +130,7 @@ impl Echo {
 }
 
 impl ProtocolHandler for Echo{
-    fn accept(&self, connection: Connection) -> BoxFuture<Result<()>> {
+    fn accept(&self, connection: Connection) -> BoxFuture<std::result::Result<(), AcceptError>> {
         Box::pin(self.clone().handle_connection(connection))
     }
 }
@@ -143,23 +147,20 @@ async fn connect(
     let (mut send_stream , mut recv_stream) = connection.open_bi().await?;
     let event_sender_clone = event_sender.clone();
     let send_task = task::spawn(async move {
-        let event_sender = event_sender_clone.clone();
-        async move {
-            let bytes_sent = payload.len();
-            send_stream.write_all(payload.as_bytes()).await?;
-            event_sender.send(ConnectEvent::Sent {
-                bytes_sent: bytes_sent as u64,
-            })
-                .await?;
-            anyhow::Ok(())
-        }
+        let bytes_sent = payload.len();
+        send_stream.write_all(payload.as_bytes()).await?;
+        event_sender_clone.send(ConnectEvent::Sent {
+            bytes_sent: bytes_sent as u64,
+        })
+            .await?;
+        anyhow::Ok(())
     });
     let n = tokio::io::copy(&mut recv_stream, &mut tokio::io::sink()).await?;
     connection.close(1u8.into(), b"done");
     event_sender.send(ConnectEvent::Received {
-        bytes_received: n as u64,
+        bytes_received: n,
     }).await?;
-    send_task.await?.await?;
+    send_task.await??;
     Ok(())
 
 }
