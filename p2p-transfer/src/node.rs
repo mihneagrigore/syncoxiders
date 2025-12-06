@@ -160,6 +160,7 @@ async fn connect(
     event_sender.send(ConnectEvent::Received {
         bytes_received: n,
     }).await?;
+
     send_task.await??;
     Ok(())
 
