@@ -36,6 +36,9 @@ pub struct P2PTransfer {
     picked_file_path: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     #[serde(skip)]
     picked_file_size: std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    #[cfg(target_arch = "wasm32")]
+    #[serde(skip)]
+    picked_file_data: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     #[serde(skip)]
     torrent_info: std::sync::Arc<std::sync::Mutex<TorrentInfo>>,
     #[serde(skip)]
@@ -80,6 +83,8 @@ impl Default for P2PTransfer {
             picked_file_name: std::sync::Arc::new(std::sync::Mutex::new(None)),
             picked_file_path: std::sync::Arc::new(std::sync::Mutex::new(None)),
             picked_file_size: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            picked_file_data: std::sync::Arc::new(std::sync::Mutex::new(None)),
             torrent_info: std::sync::Arc::new(std::sync::Mutex::new(TorrentInfo::default())),
             magnet_input: String::new(),
             node: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -131,7 +136,8 @@ impl P2PTransfer {
     #[cfg(target_arch = "wasm32")]
     fn pick_file(&mut self, ctx: &egui::Context) {
         use wasm_bindgen::JsCast;
-        use web_sys::{Event, HtmlInputElement};
+        use web_sys::{Event, HtmlInputElement, FileReader};
+        use wasm_bindgen_futures::JsFuture;
 
         self.file_input_closure = None;
 
@@ -144,6 +150,7 @@ impl P2PTransfer {
         let shared_filename = self.picked_file_name.clone();
         let shared_filepath = self.picked_file_path.clone();
         let shared_filesize = self.picked_file_size.clone();
+        let shared_filedata = self.picked_file_data.clone();
 
         let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move |event: Event| {
             let input = event.target().unwrap().dyn_into::<HtmlInputElement>().unwrap();
@@ -152,29 +159,51 @@ impl P2PTransfer {
                 if let Some(file) = files.get(0) {
                     let name = file.name();
                     let size = file.size() as u64;
-                    // In web, path is not fully accessible for security reasons, but we can use the name
                     let path = name.clone();
 
-                    web_sys::console::log_1(&format!("Picked file: {}", name).into());
+                    web_sys::console::log_1(&format!("Picked file: {} ({} bytes)", name, size).into());
 
-                    if let Some(window) = web_sys::window() {
-                        if let Some(local_storage) = window.local_storage().ok().flatten() {
-                            let _ = local_storage.set_item("picked", name.as_str());
+                    // Read file data
+                    let reader = FileReader::new().unwrap();
+                    let reader_clone = reader.clone();
+                    let name_clone = name.clone();
+                    let ctx_clone2 = ctx_clone.clone();
+                    let shared_filename2 = shared_filename.clone();
+                    let shared_filepath2 = shared_filepath.clone();
+                    let shared_filesize2 = shared_filesize.clone();
+                    let shared_filedata2 = shared_filedata.clone();
 
-                            // Update the shared states
-                            if let Ok(mut filename) = shared_filename.lock() {
-                                *filename = Some(name);
-                            }
-                            if let Ok(mut filepath) = shared_filepath.lock() {
-                                *filepath = Some(path);
-                            }
-                            if let Ok(mut filesize) = shared_filesize.lock() {
-                                *filesize = Some(size);
+                    let onload = wasm_bindgen::closure::Closure::wrap(Box::new(move |_event: Event| {
+                        if let Ok(result) = reader_clone.result() {
+                            if let Some(array_buffer) = result.dyn_ref::<js_sys::ArrayBuffer>() {
+                                let uint8_array = js_sys::Uint8Array::new(array_buffer);
+                                let data: Vec<u8> = uint8_array.to_vec();
+
+                                web_sys::console::log_1(&format!("File data read: {} bytes", data.len()).into());
+
+                                // Update shared states
+                                if let Ok(mut filename) = shared_filename2.lock() {
+                                    *filename = Some(name_clone.clone());
+                                }
+                                if let Ok(mut filepath) = shared_filepath2.lock() {
+                                    *filepath = Some(name_clone.clone());
+                                }
+                                if let Ok(mut filesize) = shared_filesize2.lock() {
+                                    *filesize = Some(data.len() as u64);
+                                }
+                                if let Ok(mut filedata) = shared_filedata2.lock() {
+                                    *filedata = Some(data);
+                                }
+
+                                ctx_clone2.request_repaint();
                             }
                         }
-                    }
+                    }) as Box<dyn FnMut(_)>);
 
-                    ctx_clone.request_repaint();
+                    reader.set_onload(Some(onload.as_ref().unchecked_ref()));
+                    onload.forget();
+
+                    let _ = reader.read_as_array_buffer(&file);
                 }
             }
         }) as Box<dyn FnMut(_)>);
@@ -214,16 +243,78 @@ impl P2PTransfer {
             let ctx_clone = ctx.clone();
             let node_id_shared = self.shared_node_id.clone();
             let node_shared = self.node.clone();
+            let logs_shared = self.terminal_logs.clone();
+            let shared_files = self.shared_files.clone();
 
             spawn_local(async move {
-                match EchoNode::spawn().await {
+                // Read all files from the shared_files list
+                let files_to_share: Vec<(String, Vec<u8>)> = if let Ok(files) = shared_files.lock() {
+                    // For WASM, we need to get file data from memory
+                    // Files are stored when picked via the file input
+                    files.iter().filter_map(|(name, _path, _size)| {
+                        // In WASM, the "path" is just the name, and we don't have direct file access
+                        // Files should be stored in memory when picked
+                        // For now, return empty vec - this will be populated when we add files
+                        None
+                    }).collect()
+                } else {
+                    Vec::new()
+                };
+
+                match EchoNode::spawn_with_files(files_to_share).await {
                     Ok(node) => {
                         let node_id = node.endpoint().node_id();
-                        web_sys::console::log_1(&format!("Node spawned with ID: {}", node_id).into());
+                        let log_msg = format!("🚀 Node spawned with ID: {}", node_id);
+                        web_sys::console::log_1(&log_msg.into());
+
+                        if let Ok(mut logs) = logs_shared.lock() {
+                            logs.push(log_msg);
+                        }
 
                         if let Ok(mut nid) = node_id_shared.lock() {
                             *nid = Some(node_id);
                         }
+
+                        // Subscribe to accept events for sender-side logging
+                        let mut accept_events = node.subscribe_accept_events();
+                        let logs_for_events = logs_shared.clone();
+                        let ctx_for_events = ctx_clone.clone();
+
+                        spawn_local(async move {
+                            while let Ok(event) = accept_events.recv().await {
+                                match event {
+                                    crate::node::AcceptEvent::Accepted { node_id } => {
+                                        let log_msg = format!("📥 Incoming connection from: {}", node_id);
+                                        web_sys::console::log_1(&log_msg.into());
+                                        if let Ok(mut logs) = logs_for_events.lock() {
+                                            logs.push(log_msg);
+                                        }
+                                        ctx_for_events.request_repaint();
+                                    }
+                                    crate::node::AcceptEvent::Echoed { node_id, bytes_sent } => {
+                                        let log_msg = format!("✅ Transfer complete to {} ({} bytes, {:.2} MB)",
+                                            node_id, bytes_sent, bytes_sent as f64 / 1024.0 / 1024.0);
+                                        web_sys::console::log_1(&log_msg.into());
+                                        if let Ok(mut logs) = logs_for_events.lock() {
+                                            logs.push(log_msg);
+                                        }
+                                        ctx_for_events.request_repaint();
+                                    }
+                                    crate::node::AcceptEvent::Closed { node_id, error } => {
+                                        let log_msg = if let Some(err) = error {
+                                            format!("❌ Connection closed with error from {}: {}", node_id, err)
+                                        } else {
+                                            format!("🔒 Connection closed with {}", node_id)
+                                        };
+                                        web_sys::console::log_1(&log_msg.into());
+                                        if let Ok(mut logs) = logs_for_events.lock() {
+                                            logs.push(log_msg);
+                                        }
+                                        ctx_for_events.request_repaint();
+                                    }
+                                }
+                            }
+                        });
 
                         // Store the node to keep it alive
                         if let Ok(mut n) = node_shared.lock() {
@@ -233,7 +324,12 @@ impl P2PTransfer {
                         ctx_clone.request_repaint();
                     }
                     Err(e) => {
-                        web_sys::console::log_1(&format!("Failed to spawn node: {}", e).into());
+                        let log_msg = format!("❌ Failed to spawn node: {}", e);
+                        web_sys::console::log_1(&log_msg.into());
+
+                        if let Ok(mut logs) = logs_shared.lock() {
+                            logs.push(log_msg);
+                        }
                     }
                 }
             });
@@ -410,23 +506,107 @@ impl P2PTransfer {
             let node_shared = self.node.clone();
             let status_shared = self.receive_status.clone();
             let is_receiving_shared = self.is_receiving.clone();
+            let received_files_shared = self.received_files.clone();
 
             spawn_local(async move {
                 match EchoNode::spawn().await {
                     Ok(node) => {
                         web_sys::console::log_1(&format!("Connecting to node: {}", target_node_id).into());
 
+                        // Get events from connecting
+                        let dummy_data = b"SEND_FILE".to_vec();
+                        let mut events = node.connect(target_node_id, dummy_data, "request".to_string());
+
                         // Store the node
                         if let Ok(mut n) = node_shared.lock() {
                             *n = Some(node);
                         }
 
-                        // Update status
-                        if let Ok(mut status) = status_shared.lock() {
-                            *status = "Connected! Waiting for files...".to_string();
-                        }
+                        // Store file chunks temporarily
+                        let mut current_file: Option<(String, Vec<Vec<u8>>)> = None;
 
-                        web_sys::console::log_1(&"Connected! Waiting for files...".into());
+                        // Process connection events
+                        use n0_future::StreamExt;
+                        while let Some(event) = events.next().await {
+                            match event {
+                                crate::node::ConnectEvent::Connected => {
+                                    web_sys::console::log_1(&"✓ Connected! Waiting for files...".into());
+                                    if let Ok(mut status) = status_shared.lock() {
+                                        *status = "Connected! Waiting for files...".to_string();
+                                    }
+                                    ctx_clone.request_repaint();
+                                }
+                                crate::node::ConnectEvent::Sent { .. } => {}
+                                crate::node::ConnectEvent::FileStart { file_name, file_size, total_chunks } => {
+                                    web_sys::console::log_1(&format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks).into());
+                                    if let Ok(mut status) = status_shared.lock() {
+                                        *status = format!("Receiving: {} (0%)", file_name);
+                                    }
+                                    current_file = Some((file_name, vec![Vec::new(); total_chunks as usize]));
+                                    ctx_clone.request_repaint();
+                                }
+                                crate::node::ConnectEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset: _ } => {
+                                    if let Some((ref name, ref mut chunks)) = current_file {
+                                        if name == &file_name && (chunk_index as usize) < chunks.len() {
+                                            chunks[chunk_index as usize] = chunk_data;
+                                            web_sys::console::log_1(&format!("  ✓ Chunk {} received", chunk_index).into());
+                                        }
+                                    }
+                                    ctx_clone.request_repaint();
+                                }
+                                crate::node::ConnectEvent::FileComplete { file_name, total_bytes } => {
+                                    web_sys::console::log_1(&format!("✅ File complete: {} ({} bytes)", file_name, total_bytes).into());
+
+                                    // Combine all chunks and trigger download
+                                    if let Some((name, chunks)) = current_file.take() {
+                                        if name == file_name {
+                                            let combined_data: Vec<u8> = chunks.into_iter().flatten().collect();
+
+                                            // Trigger automatic download in browser
+                                            Self::download_file_wasm(&file_name, &combined_data);
+
+                                            let timestamp = js_sys::Date::now() as u64 / 1000;
+                                            let received_file = ReceivedFile {
+                                                name: file_name.clone(),
+                                                size: total_bytes,
+                                                saved_path: "Downloaded to browser".to_string(),
+                                                timestamp: format!("{}", timestamp),
+                                            };
+
+                                            if let Ok(mut files) = received_files_shared.lock() {
+                                                files.push(received_file);
+                                            }
+
+                                            if let Ok(mut status) = status_shared.lock() {
+                                                *status = format!("File downloaded: {}", file_name);
+                                            }
+                                        }
+                                    }
+
+                                    ctx_clone.request_repaint();
+                                }
+                                crate::node::ConnectEvent::Closed { error } => {
+                                    let msg = if let Some(err) = &error {
+                                        format!("✗ Connection closed with error: {}", err)
+                                    } else {
+                                        "✓ Connection closed successfully".to_string()
+                                    };
+                                    web_sys::console::log_1(&msg.into());
+
+                                    if let Some(err) = error {
+                                        if let Ok(mut status) = status_shared.lock() {
+                                            *status = format!("Error: {}", err);
+                                        }
+                                    } else {
+                                        if let Ok(mut status) = status_shared.lock() {
+                                            *status = "Transfer complete!".to_string();
+                                        }
+                                    }
+                                    ctx_clone.request_repaint();
+                                    break;
+                                }
+                            }
+                        }
 
                         ctx_clone.request_repaint();
                     }
@@ -908,7 +1088,7 @@ impl P2PTransfer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn download_file(&self, file_name: &str, file_data: &[u8]) {
+    fn download_file_wasm(file_name: &str, file_data: &[u8]) {
         use wasm_bindgen::JsCast;
         use web_sys::{Blob, BlobPropertyBag, Url, HtmlAnchorElement};
 
@@ -1034,13 +1214,9 @@ impl P2PTransfer {
                         }
                         #[cfg(target_arch = "wasm32")]
                         {
-                            if let Ok(data) = self.picked_file_data.lock() {
-                                if let Some(file_data) = data.as_ref() {
-                                    if let Ok(mut nf) = node_files.lock() {
-                                        nf.push((name.clone(), file_data.clone()));
-                                    }
-                                }
-                            }
+                            // For WASM, file data should be in picked_file_data
+                            // This needs special handling since we can't read from filesystem
+                            web_sys::console::log_1(&"WASM: Cannot update running node file list directly".into());
                         }
                     }
                 }
