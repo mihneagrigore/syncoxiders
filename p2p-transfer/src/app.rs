@@ -451,47 +451,100 @@ impl P2PTransfer {
                                 crate::node::ConnectEvent::Sent { .. } => {
                                     // Ignore - this is just the dummy request data
                                 }
-                                crate::node::ConnectEvent::Received { bytes_received, file_name, file_data } => {
-                                    let log_msg = format!("← Received file: {} ({} bytes)", file_name, bytes_received);
+                                crate::node::ConnectEvent::FileStart { file_name, file_size, total_chunks } => {
+                                    let log_msg = format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks);
+                                    println!("{}", log_msg);
+
+                                    if let Ok(mut logs) = logs_shared.lock() {
+                                        logs.push(log_msg.clone());
+                                    }
+                                    if let Ok(mut status) = status_shared.lock() {
+                                        *status = format!("Receiving: {} (0%)", file_name);
+                                    }
+
+                                    // Create/truncate file with the expected size
+                                    if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                        if let Some(save_dir) = save_dir_opt.as_ref() {
+                                            let file_path = std::path::Path::new(save_dir).join(&file_name);
+                                            // Pre-allocate file with correct size
+                                            if let Err(e) = std::fs::OpenOptions::new()
+                                                .write(true)
+                                                .create(true)
+                                                .truncate(true)
+                                                .open(&file_path)
+                                                .and_then(|f| f.set_len(file_size))
+                                            {
+                                                let err_msg = format!("Error creating file: {}", e);
+                                                println!("{}", err_msg);
+                                                if let Ok(mut logs) = logs_shared.lock() {
+                                                    logs.push(err_msg);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    ctx_clone.request_repaint();
+                                }
+                                crate::node::ConnectEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset } => {
+                                    // Write chunk at specific offset
+                                    if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                        if let Some(save_dir) = save_dir_opt.as_ref() {
+                                            let file_path = std::path::Path::new(save_dir).join(&file_name);
+
+                                            use std::io::{Seek, SeekFrom, Write};
+                                            match std::fs::OpenOptions::new()
+                                                .write(true)
+                                                .open(&file_path)
+                                                .and_then(|mut f| {
+                                                    f.seek(SeekFrom::Start(offset))?;
+                                                    f.write_all(&chunk_data)?;
+                                                    Ok(())
+                                                })
+                                            {
+                                                Ok(_) => {
+                                                    let log_msg = format!("  ✓ Chunk {}: {} bytes at offset {}", chunk_index, chunk_data.len(), offset);
+                                                    if let Ok(mut logs) = logs_shared.lock() {
+                                                        logs.push(log_msg);
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                    let err_msg = format!("  ✗ Error writing chunk {}: {}", chunk_index, e);
+                                                    println!("{}", err_msg);
+                                                    if let Ok(mut logs) = logs_shared.lock() {
+                                                        logs.push(err_msg);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    ctx_clone.request_repaint();
+                                }
+                                crate::node::ConnectEvent::FileComplete { file_name, total_bytes } => {
+                                    let log_msg = format!("✅ File complete: {} ({} bytes)", file_name, total_bytes);
                                     println!("{}", log_msg);
 
                                     if let Ok(mut logs) = logs_shared.lock() {
                                         logs.push(log_msg.clone());
                                     }
 
-                                    // Save file directly to disk
-                                    let save_result = if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                    // Add to received files list
+                                    if let Ok(save_dir_opt) = save_directory_shared.lock() {
                                         if let Some(save_dir) = save_dir_opt.as_ref() {
                                             let file_path = std::path::Path::new(save_dir).join(&file_name);
-                                            match std::fs::write(&file_path, &file_data) {
-                                                Ok(_) => {
-                                                    Some((file_path.to_string_lossy().to_string(), format!("File saved: {}", file_name)))
-                                                },
-                                                Err(e) => {
-                                                    Some((String::new(), format!("Error saving file: {}", e)))
-                                                }
+                                            let saved_path = file_path.to_string_lossy().to_string();
+
+                                            if let Ok(mut status) = status_shared.lock() {
+                                                *status = format!("File saved: {}", file_name);
                                             }
-                                        } else {
-                                            Some((String::new(), "No save directory selected".to_string()))
-                                        }
-                                    } else {
-                                        None
-                                    };
 
-                                    if let Some((saved_path, status_msg)) = save_result {
-                                        if let Ok(mut status) = status_shared.lock() {
-                                            *status = status_msg.clone();
-                                        }
-
-                                        // Only store metadata if file was saved successfully
-                                        if !saved_path.is_empty() {
                                             let timestamp = std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .unwrap()
                                                 .as_secs();
                                             let received_file = ReceivedFile {
                                                 name: file_name.clone(),
-                                                size: bytes_received,
+                                                size: total_bytes,
                                                 saved_path,
                                                 timestamp: format!("{}", timestamp),
                                             };
@@ -611,66 +664,138 @@ impl P2PTransfer {
                     crate::node::ConnectEvent::Sent { .. } => {
                         // Ignore - this is just the dummy request data
                     }
-                    crate::node::ConnectEvent::Received { bytes_received, file_name, file_data } => {
-                        let log_msg = format!("← Received file: {} ({} bytes)", file_name, bytes_received);
+                    crate::node::ConnectEvent::FileStart { file_name, file_size, total_chunks } => {
+                        let log_msg = format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks);
                         println!("{}", log_msg);
 
                         if let Ok(mut logs) = logs_shared.lock() {
                             logs.push(log_msg.clone());
                         }
+                        if let Ok(mut status) = status_shared.lock() {
+                            *status = format!("Receiving: {} (0%)", file_name);
+                        }
 
-                        // Save file directly to disk
-                        let save_result = if let Ok(save_dir_opt) = save_directory_shared.lock() {
-                            if let Some(save_dir) = save_dir_opt.as_ref() {
-                                let file_path = std::path::Path::new(save_dir).join(&file_name);
-
-                                // Check if file already exists at this path
-                                let file_exists = if let Ok(files) = received_files_shared.lock() {
-                                    files.iter().any(|f| f.name == file_name)
-                                } else {
-                                    false
-                                };
-
-                                if !file_exists {
-                                    match std::fs::write(&file_path, &file_data) {
-                                        Ok(_) => {
-                                            Some((file_path.to_string_lossy().to_string(), format!("File saved: {}", file_name)))
-                                        },
-                                        Err(e) => {
-                                            Some((String::new(), format!("Error saving file: {}", e)))
-                                        }
-                                    }
-                                } else {
-                                    Some((String::new(), format!("File already exists: {}", file_name)))
-                                }
-                            } else {
-                                Some((String::new(), "No save directory selected".to_string()))
-                            }
+                        // Check if file already exists
+                        let file_exists = if let Ok(files) = received_files_shared.lock() {
+                            files.iter().any(|f| f.name == file_name)
                         } else {
-                            None
+                            false
                         };
 
-                        if let Some((saved_path, status_msg)) = save_result {
-                            if let Ok(mut status) = status_shared.lock() {
-                                *status = status_msg.clone();
+                        if !file_exists {
+                            // Create/truncate file with the expected size
+                            if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                if let Some(save_dir) = save_dir_opt.as_ref() {
+                                    let file_path = std::path::Path::new(save_dir).join(&file_name);
+                                    // Pre-allocate file with correct size
+                                    if let Err(e) = std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .create(true)
+                                        .truncate(true)
+                                        .open(&file_path)
+                                        .and_then(|f| f.set_len(file_size))
+                                    {
+                                        let err_msg = format!("Error creating file: {}", e);
+                                        println!("{}", err_msg);
+                                        if let Ok(mut logs) = logs_shared.lock() {
+                                            logs.push(err_msg);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        ctx_clone.request_repaint();
+                    }
+                    crate::node::ConnectEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset } => {
+                        // Check if file already exists in received files
+                        let file_exists = if let Ok(files) = received_files_shared.lock() {
+                            files.iter().any(|f| f.name == file_name)
+                        } else {
+                            false
+                        };
+
+                        if !file_exists {
+                            // Write chunk at specific offset
+                            if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                if let Some(save_dir) = save_dir_opt.as_ref() {
+                                    let file_path = std::path::Path::new(save_dir).join(&file_name);
+
+                                    use std::io::{Seek, SeekFrom, Write};
+                                    match std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .open(&file_path)
+                                        .and_then(|mut f| {
+                                            f.seek(SeekFrom::Start(offset))?;
+                                            f.write_all(&chunk_data)?;
+                                            Ok(())
+                                        })
+                                    {
+                                        Ok(_) => {
+                                            let log_msg = format!("  ✓ Chunk {}: {} bytes at offset {}", chunk_index, chunk_data.len(), offset);
+                                            if let Ok(mut logs) = logs_shared.lock() {
+                                                logs.push(log_msg);
+                                            }
+                                        },
+                                        Err(e) => {
+                                            let err_msg = format!("  ✗ Error writing chunk {}: {}", chunk_index, e);
+                                            println!("{}", err_msg);
+                                            if let Ok(mut logs) = logs_shared.lock() {
+                                                logs.push(err_msg);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        ctx_clone.request_repaint();
+                    }
+                    crate::node::ConnectEvent::FileComplete { file_name, total_bytes } => {
+                        // Check if file already exists
+                        let file_exists = if let Ok(files) = received_files_shared.lock() {
+                            files.iter().any(|f| f.name == file_name)
+                        } else {
+                            false
+                        };
+
+                        if !file_exists {
+                            let log_msg = format!("✅ File complete: {} ({} bytes)", file_name, total_bytes);
+                            println!("{}", log_msg);
+
+                            if let Ok(mut logs) = logs_shared.lock() {
+                                logs.push(log_msg.clone());
                             }
 
-                            // Only store metadata if file was saved successfully
-                            if !saved_path.is_empty() {
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs();
-                                let received_file = ReceivedFile {
-                                    name: file_name.clone(),
-                                    size: bytes_received,
-                                    saved_path,
-                                    timestamp: format!("{}", timestamp),
-                                };
+                            // Add to received files list
+                            if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                if let Some(save_dir) = save_dir_opt.as_ref() {
+                                    let file_path = std::path::Path::new(save_dir).join(&file_name);
+                                    let saved_path = file_path.to_string_lossy().to_string();
 
-                                if let Ok(mut files) = received_files_shared.lock() {
-                                    files.push(received_file);
+                                    if let Ok(mut status) = status_shared.lock() {
+                                        *status = format!("File saved: {}", file_name);
+                                    }
+
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs();
+                                    let received_file = ReceivedFile {
+                                        name: file_name.clone(),
+                                        size: total_bytes,
+                                        saved_path,
+                                        timestamp: format!("{}", timestamp),
+                                    };
+
+                                    if let Ok(mut files) = received_files_shared.lock() {
+                                        files.push(received_file);
+                                    }
                                 }
+                            }
+                        } else {
+                            if let Ok(mut status) = status_shared.lock() {
+                                *status = format!("File already exists: {}", file_name);
                             }
                         }
 
