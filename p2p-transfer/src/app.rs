@@ -278,7 +278,7 @@ impl P2PTransfer {
                 match EchoNode::spawn_with_files(files_to_share).await {
                     Ok(node) => {
                         let node_id = node.endpoint().node_id();
-                        let log_msg = format!("Node spawned with ID: {}", node_id);
+                        let log_msg = format!("🚀 Node spawned with ID: {}", node_id);
                         println!("{}", log_msg);
 
                         if let Ok(mut logs) = logs_shared.lock() {
@@ -289,6 +289,47 @@ impl P2PTransfer {
                             *nid = Some(node_id);
                         }
 
+                        // Subscribe to accept events for sender-side logging
+                        let mut accept_events = node.subscribe_accept_events();
+                        let logs_for_events = logs_shared.clone();
+                        let ctx_for_events = ctx_clone.clone();
+
+                        tokio::spawn(async move {
+                            while let Ok(event) = accept_events.recv().await {
+                                match event {
+                                    crate::node::AcceptEvent::Accepted { node_id } => {
+                                        let log_msg = format!("📥 Incoming connection from: {}", node_id);
+                                        println!("{}", log_msg);
+                                        if let Ok(mut logs) = logs_for_events.lock() {
+                                            logs.push(log_msg);
+                                        }
+                                        ctx_for_events.request_repaint();
+                                    }
+                                    crate::node::AcceptEvent::Echoed { node_id, bytes_sent } => {
+                                        let log_msg = format!("✅ Transfer complete to {} ({} bytes, {:.2} MB)",
+                                            node_id, bytes_sent, bytes_sent as f64 / 1024.0 / 1024.0);
+                                        println!("{}", log_msg);
+                                        if let Ok(mut logs) = logs_for_events.lock() {
+                                            logs.push(log_msg);
+                                        }
+                                        ctx_for_events.request_repaint();
+                                    }
+                                    crate::node::AcceptEvent::Closed { node_id, error } => {
+                                        let log_msg = if let Some(err) = error {
+                                            format!("❌ Connection closed with error from {}: {}", node_id, err)
+                                        } else {
+                                            format!("🔒 Connection closed with {}", node_id)
+                                        };
+                                        println!("{}", log_msg);
+                                        if let Ok(mut logs) = logs_for_events.lock() {
+                                            logs.push(log_msg);
+                                        }
+                                        ctx_for_events.request_repaint();
+                                    }
+                                }
+                            }
+                        });
+
                         // Store the node to keep it alive
                         if let Ok(mut n) = node_shared.lock() {
                             *n = Some(node);
@@ -297,7 +338,7 @@ impl P2PTransfer {
                         ctx_clone.request_repaint();
                     }
                     Err(e) => {
-                        let log_msg = format!("Failed to spawn node: {}", e);
+                        let log_msg = format!("❌ Failed to spawn node: {}", e);
                         println!("{}", log_msg);
 
                         if let Ok(mut logs) = logs_shared.lock() {
@@ -1227,6 +1268,18 @@ impl P2PTransfer {
                             if stop_btn.clicked() {
                                 should_stop = true;
                             }
+
+                            ui.add_space(5.0);
+
+                            let view_btn = ui.add(
+                                Button::new(RichText::new("👁 View Logs").text_style(TextStyle::Button).color(Color32::WHITE))
+                                    .fill(Color32::from_rgb(100, 150, 200))
+                            );
+                            view_btn.clone().on_hover_text("View transfer logs");
+
+                            if view_btn.clicked() {
+                                self.show_terminal_view = !self.show_terminal_view;
+                            }
                         });
                     });
 
@@ -1351,7 +1404,7 @@ impl P2PTransfer {
                         ui.add_space(5.0);
 
                         let view_btn = ui.add(
-                            Button::new(RichText::new("👁 View").text_style(TextStyle::Button).color(Color32::WHITE))
+                            Button::new(RichText::new("👁 View Logs").text_style(TextStyle::Button).color(Color32::WHITE))
                                 .fill(Color32::from_rgb(100, 150, 200))
                         );
                         view_btn.clone().on_hover_text("View terminal logs");
@@ -1588,7 +1641,7 @@ impl eframe::App for P2PTransfer {
                                     ui.add_space(5.0);
 
                                     let view_btn = ui.add(
-                                        Button::new(RichText::new("👁 View").text_style(TextStyle::Button).color(Color32::WHITE))
+                                        Button::new(RichText::new("👁 View Logs").text_style(TextStyle::Button).color(Color32::WHITE))
                                             .fill(Color32::from_rgb(100, 150, 200))
                                     );
                                     view_btn.clone().on_hover_text("View terminal logs");
