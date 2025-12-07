@@ -1,16 +1,14 @@
 use eframe::egui;
 use egui::{Button, Color32, Grid, Label, RichText, TextStyle, Ui, Vec2};
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::{JsCast, JsValue};
 use crate::node::EchoNode;
 use iroh::NodeId;
-use anyhow::Result;
 
 #[derive(Debug, Clone)]
 struct ReceivedFile {
     name: String,
     size: u64,
-    data: Vec<u8>,
+    saved_path: String,
     timestamp: String,
 }
 
@@ -68,6 +66,8 @@ pub struct P2PTransfer {
     received_files: std::sync::Arc<std::sync::Mutex<Vec<ReceivedFile>>>,
     #[serde(skip)]
     shared_files: std::sync::Arc<std::sync::Mutex<Vec<(String, String, u64)>>>, // (name, path, size)
+    #[serde(skip)]
+    save_directory: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 
 }
 
@@ -95,6 +95,7 @@ impl Default for P2PTransfer {
             show_terminal_view: false,
             received_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             shared_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            save_directory: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -410,6 +411,7 @@ impl P2PTransfer {
             let logs_shared = self.terminal_logs.clone();
             let is_receiving_shared = self.is_receiving.clone();
             let received_files_shared = self.received_files.clone();
+            let save_directory_shared = self.save_directory.clone();
 
             tokio::spawn(async move {
                 match EchoNode::spawn().await {
@@ -456,24 +458,48 @@ impl P2PTransfer {
                                     if let Ok(mut logs) = logs_shared.lock() {
                                         logs.push(log_msg.clone());
                                     }
-                                    if let Ok(mut status) = status_shared.lock() {
-                                        *status = format!("File received: {}", file_name);
-                                    }
 
-                                    // Store the received file
-                                    let timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_secs();
-                                    let received_file = ReceivedFile {
-                                        name: file_name.clone(),
-                                        size: bytes_received,
-                                        data: file_data,
-                                        timestamp: format!("{}", timestamp),
+                                    // Save file directly to disk
+                                    let save_result = if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                        if let Some(save_dir) = save_dir_opt.as_ref() {
+                                            let file_path = std::path::Path::new(save_dir).join(&file_name);
+                                            match std::fs::write(&file_path, &file_data) {
+                                                Ok(_) => {
+                                                    Some((file_path.to_string_lossy().to_string(), format!("File saved: {}", file_name)))
+                                                },
+                                                Err(e) => {
+                                                    Some((String::new(), format!("Error saving file: {}", e)))
+                                                }
+                                            }
+                                        } else {
+                                            Some((String::new(), "No save directory selected".to_string()))
+                                        }
+                                    } else {
+                                        None
                                     };
 
-                                    if let Ok(mut files) = received_files_shared.lock() {
-                                        files.push(received_file);
+                                    if let Some((saved_path, status_msg)) = save_result {
+                                        if let Ok(mut status) = status_shared.lock() {
+                                            *status = status_msg.clone();
+                                        }
+
+                                        // Only store metadata if file was saved successfully
+                                        if !saved_path.is_empty() {
+                                            let timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_secs();
+                                            let received_file = ReceivedFile {
+                                                name: file_name.clone(),
+                                                size: bytes_received,
+                                                saved_path,
+                                                timestamp: format!("{}", timestamp),
+                                            };
+
+                                            if let Ok(mut files) = received_files_shared.lock() {
+                                                files.push(received_file);
+                                            }
+                                        }
                                     }
 
                                     ctx_clone.request_repaint();
@@ -532,6 +558,7 @@ impl P2PTransfer {
         let status_shared = self.receive_status.clone();
         let logs_shared = self.terminal_logs.clone();
         let received_files_shared = self.received_files.clone();
+        let save_directory_shared = self.save_directory.clone();
 
         if let Ok(mut status) = self.receive_status.lock() {
             *status = "Refreshing files...".to_string();
@@ -591,31 +618,59 @@ impl P2PTransfer {
                         if let Ok(mut logs) = logs_shared.lock() {
                             logs.push(log_msg.clone());
                         }
-                        if let Ok(mut status) = status_shared.lock() {
-                            *status = format!("File received: {}", file_name);
-                        }
 
-                        // Check if file already exists
-                        let mut file_exists = false;
-                        if let Ok(files) = received_files_shared.lock() {
-                            file_exists = files.iter().any(|f| f.name == file_name && f.data == file_data);
-                        }
+                        // Save file directly to disk
+                        let save_result = if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                            if let Some(save_dir) = save_dir_opt.as_ref() {
+                                let file_path = std::path::Path::new(save_dir).join(&file_name);
 
-                        // Only add if it doesn't exist
-                        if !file_exists {
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            let received_file = ReceivedFile {
-                                name: file_name.clone(),
-                                size: bytes_received,
-                                data: file_data,
-                                timestamp: format!("{}", timestamp),
-                            };
+                                // Check if file already exists at this path
+                                let file_exists = if let Ok(files) = received_files_shared.lock() {
+                                    files.iter().any(|f| f.name == file_name)
+                                } else {
+                                    false
+                                };
 
-                            if let Ok(mut files) = received_files_shared.lock() {
-                                files.push(received_file);
+                                if !file_exists {
+                                    match std::fs::write(&file_path, &file_data) {
+                                        Ok(_) => {
+                                            Some((file_path.to_string_lossy().to_string(), format!("File saved: {}", file_name)))
+                                        },
+                                        Err(e) => {
+                                            Some((String::new(), format!("Error saving file: {}", e)))
+                                        }
+                                    }
+                                } else {
+                                    Some((String::new(), format!("File already exists: {}", file_name)))
+                                }
+                            } else {
+                                Some((String::new(), "No save directory selected".to_string()))
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some((saved_path, status_msg)) = save_result {
+                            if let Ok(mut status) = status_shared.lock() {
+                                *status = status_msg.clone();
+                            }
+
+                            // Only store metadata if file was saved successfully
+                            if !saved_path.is_empty() {
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs();
+                                let received_file = ReceivedFile {
+                                    name: file_name.clone(),
+                                    size: bytes_received,
+                                    saved_path,
+                                    timestamp: format!("{}", timestamp),
+                                };
+
+                                if let Ok(mut files) = received_files_shared.lock() {
+                                    files.push(received_file);
+                                }
                             }
                         }
 
@@ -722,37 +777,6 @@ impl P2PTransfer {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn download_file(&self, file_name: &str, file_data: &[u8]) {
-        use rfd::FileDialog;
-        use std::io::Write;
-
-        if let Some(path) = FileDialog::new()
-            .set_file_name(file_name)
-            .save_file()
-        {
-            match std::fs::File::create(&path) {
-                Ok(mut file) => {
-                    if let Err(e) = file.write_all(file_data) {
-                        eprintln!("Failed to write file: {}", e);
-                        if let Ok(mut logs) = self.terminal_logs.lock() {
-                            logs.push(format!("✗ Failed to save file: {}", e));
-                        }
-                    } else {
-                        println!("✓ File saved to: {}", path.display());
-                        if let Ok(mut logs) = self.terminal_logs.lock() {
-                            logs.push(format!("✓ File saved to: {}", path.display()));
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to create file: {}", e);
-                    if let Ok(mut logs) = self.terminal_logs.lock() {
-                        logs.push(format!("✗ Failed to create file: {}", e));
-                    }
-                }
-            }
-        }
-    }
 
     fn show_received_files(&mut self, ui: &mut Ui) {
         if let Ok(files) = self.received_files.lock() {
@@ -777,20 +801,11 @@ impl P2PTransfer {
                     // Display each received file
                     for (index, file) in files.iter().enumerate() {
                         ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.strong(&file.name);
-                                    ui.label(format!("Size: {}", self.format_size(file.size)));
-                                    ui.label(format!("Received: {}", file.timestamp));
-                                });
-
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let download_btn = ui.button(RichText::new("💾 Download").color(Color32::WHITE));
-
-                                    if download_btn.clicked() {
-                                        self.download_file(&file.name, &file.data);
-                                    }
-                                });
+                            ui.vertical(|ui| {
+                                ui.strong(&file.name);
+                                ui.label(format!("Size: {}", self.format_size(file.size)));
+                                ui.label(format!("Saved to: {}", file.saved_path));
+                                ui.label(format!("Received: {}", file.timestamp));
                             });
                         });
 
@@ -805,7 +820,7 @@ impl P2PTransfer {
 
     // Added this method to fix the missing generate_magnet_uri error
 
-    fn add_file_to_share(&mut self, ctx: &egui::Context) {
+    fn add_file_to_share(&mut self, _ctx: &egui::Context) {
         // Get the currently picked file
         let file_info = {
             let name = self.picked_file_name.lock().ok().and_then(|f| f.clone());
@@ -1348,6 +1363,39 @@ impl eframe::App for P2PTransfer {
                             ui.separator();
                             ui.add_space(8.0);
 
+                            // Save directory selection
+                            ui.label(RichText::new("Select folder to save files:").strong());
+                            ui.add_space(5.0);
+
+                            ui.horizontal(|ui| {
+                                if let Ok(save_dir) = self.save_directory.lock() {
+                                    if let Some(dir) = save_dir.as_ref() {
+                                        ui.label(RichText::new(format!("📁 {}", dir)).color(Color32::from_rgb(100, 200, 100)));
+                                    } else {
+                                        ui.label(RichText::new("No folder selected").color(Color32::from_rgb(200, 100, 100)));
+                                    }
+                                }
+
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    let select_folder_btn = ui.add(
+                                        Button::new(RichText::new("📂 Select Folder").color(Color32::WHITE))
+                                            .fill(Color32::from_rgb(70, 130, 180))
+                                    );
+
+                                    if select_folder_btn.clicked() {
+                                        use rfd::FileDialog;
+                                        if let Some(folder) = FileDialog::new().pick_folder() {
+                                            if let Ok(mut save_dir) = self.save_directory.lock() {
+                                                *save_dir = Some(folder.to_string_lossy().to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+
+                            ui.add_space(10.0);
+
                             ui.label(RichText::new("Enter the node hash to connect:").strong());
                             ui.add_space(10.0);
 
@@ -1367,8 +1415,22 @@ impl eframe::App for P2PTransfer {
 
                             ui.horizontal(|ui| {
                                 let is_receiving = self.is_receiving.lock().map(|r| *r).unwrap_or(false);
+                                let has_save_dir = self.save_directory.lock().ok()
+                                    .and_then(|d| d.as_ref().map(|_| true))
+                                    .unwrap_or(false);
+
                                 if !is_receiving {
-                                    if ui.button("Connect").clicked() {
+                                    let mut connect_btn = ui.add_enabled(
+                                        has_save_dir,
+                                        Button::new(RichText::new("Connect").color(Color32::WHITE))
+                                            .fill(Color32::from_rgb(50, 150, 100))
+                                    );
+
+                                    if !has_save_dir {
+                                        connect_btn = connect_btn.on_hover_text("Please select a folder first");
+                                    }
+
+                                    if connect_btn.clicked() {
                                         if let Ok(node_id) = self.receive_hash_input.parse::<NodeId>() {
                                             self.start_receiving(ctx, node_id);
                                         } else {
