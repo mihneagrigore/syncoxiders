@@ -46,13 +46,8 @@ impl EchoNode {
     }
 
     pub fn subscribe_accept_events(&self) -> Receiver<AcceptEvent> {
-        // Note: async_channel doesn't support broadcast natively like tokio's broadcast
-        // Each subscriber gets a new channel. Events are cloned to all subscribers.
         let (tx, rx) = unbounded();
         let _main_sender = self.accept_events.clone();
-        // In a real implementation, you'd set up proper fan-out here
-        // For now, we return an empty receiver as a placeholder
-        // Events will be sent directly from the accept handler
         rx
     }
 
@@ -75,9 +70,7 @@ impl EchoNode {
 }
 
 #[derive(Debug)]
-pub enum ConnectEvent {
-    Connected,
-    Sent {bytes_sent: u64},
+pub enum TransferEvent {
     FileStart {
         file_name: String,
         file_size: u64,
@@ -93,6 +86,13 @@ pub enum ConnectEvent {
         file_name: String,
         total_bytes: u64,
     },
+}
+
+#[derive(Debug)]
+pub enum ConnectEvent {
+    Connected,
+    Sent {bytes_sent: u64},
+    Transfer(TransferEvent),
     Closed {error: Option<String>}
 }
 
@@ -147,7 +147,7 @@ impl Echo{
     }
 
     async fn handle_connection_0(&self, connection: &Connection) -> std::result::Result<(), AcceptError> {
-        const CHUNK_SIZE: usize = 256 * 1024; // 256 KB chunks
+        const CHUNK_SIZE: usize = 256 * 1024;
 
         let node_id = connection.remote_node_id()?;
         info!("✓ Connection accepted from {}", node_id);
@@ -178,20 +178,16 @@ impl Echo{
         info!("✓ Received connection request from receiver");
         info!("📦 Preparing files to send...");
 
-        // Get all files to send
         let files_to_send = if let Ok(files) = self.files.lock() {
             if !files.is_empty() {
                 files.clone()
             } else {
-                // Fallback: echo back what was received
                 vec![(_received_file_name, _received_file_data)]
             }
         } else {
-            // Fallback: echo back what was received
             vec![(_received_file_name, _received_file_data)]
         };
 
-        // First, send the number of files
         let num_files = files_to_send.len() as u32;
         send.write_all(&num_files.to_le_bytes()).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         info!("📤 Sending {} file(s)", num_files);
@@ -209,7 +205,6 @@ impl Echo{
 
             info!("  ⚙️  File will be sent in {} chunk(s) of {}KB each", total_chunks, CHUNK_SIZE / 1024);
 
-            // Send file metadata: name_len, name, data_len, total_chunks
             send.write_all(&name_len.to_le_bytes()).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             send.write_all(name_bytes).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             send.write_all(&data_len.to_le_bytes()).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -218,13 +213,11 @@ impl Echo{
 
             total_bytes_sent += 4 + name_bytes.len() + 8 + 4;
 
-            // Send file data in chunks
             for chunk_idx in 0..total_chunks {
                 let offset = chunk_idx as usize * CHUNK_SIZE;
                 let chunk_size = std::cmp::min(CHUNK_SIZE, data.len() - offset);
                 let chunk_data = &data[offset..offset + chunk_size];
 
-                // Send: chunk_index (u32), chunk_size (u32), chunk_data
                 send.write_all(&chunk_idx.to_le_bytes()).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                 send.write_all(&(chunk_size as u32).to_le_bytes()).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                 send.write_all(chunk_data).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -279,7 +272,6 @@ async fn connect(
 
     let send_task = task::spawn(async move {
         info!("📤 Sending file request...");
-        // First send the filename length as u32
         let name_bytes = file_name.as_bytes();
         let name_len = name_bytes.len() as u32;
         send_stream.write_all(&name_len.to_le_bytes()).await?;
@@ -312,7 +304,6 @@ async fn connect(
     let num_files = u32::from_le_bytes(num_files_buf) as usize;
     info!("📦 Receiving {} file(s)", num_files);
 
-    // Read all files in chunks
     for file_idx in 0..num_files {
         info!("📁 [{}/{}] Receiving file metadata...", file_idx + 1, num_files);
         // Read file metadata
@@ -334,18 +325,15 @@ async fn connect(
 
         info!("  ✓ File: {} ({} bytes, {} chunks)", received_file_name, data_len, total_chunks);
 
-        // Notify that file transfer is starting
-        event_sender.send(ConnectEvent::FileStart {
+        event_sender.send(ConnectEvent::Transfer(TransferEvent::FileStart {
             file_name: received_file_name.clone(),
             file_size: data_len,
             total_chunks,
-        }).await?;
+        })).await?;
 
-        // Read all chunks for this file
         let mut total_bytes_received = 0u64;
         for chunk_num in 0..total_chunks {
             let progress = ((chunk_num + 1) as f32 / total_chunks as f32 * 100.0) as u32;
-            // Read chunk metadata
             let mut chunk_idx_buf = [0u8; 4];
             recv_stream.read_exact(&mut chunk_idx_buf).await?;
             let chunk_index = u32::from_le_bytes(chunk_idx_buf);
@@ -354,31 +342,28 @@ async fn connect(
             recv_stream.read_exact(&mut chunk_size_buf).await?;
             let chunk_size = u32::from_le_bytes(chunk_size_buf) as usize;
 
-            // Read chunk data
             let mut chunk_data = vec![0u8; chunk_size];
             recv_stream.read_exact(&mut chunk_data).await?;
 
-            let offset = chunk_index as u64 * 256 * 1024; // 256KB chunk size
+            let offset = chunk_index as u64 * 256 * 1024;
             total_bytes_received += chunk_size as u64;
 
             info!("  📥 Chunk {}/{} received ({}KB) - {}% complete", chunk_num + 1, total_chunks, chunk_size / 1024, progress);
 
-            // Send chunk received event
-            event_sender.send(ConnectEvent::ChunkReceived {
+            event_sender.send(ConnectEvent::Transfer(TransferEvent::ChunkReceived {
                 file_name: received_file_name.clone(),
                 chunk_index,
                 chunk_data,
                 offset,
-            }).await?;
+            })).await?;
         }
 
         info!("✅ File complete: {} ({} bytes)", received_file_name, total_bytes_received);
 
-        // Notify that file transfer is complete
-        event_sender.send(ConnectEvent::FileComplete {
+        event_sender.send(ConnectEvent::Transfer(TransferEvent::FileComplete {
             file_name: received_file_name,
             total_bytes: total_bytes_received,
-        }).await?;
+        })).await?;
     }
 
     info!("🔒 Closing connection...");

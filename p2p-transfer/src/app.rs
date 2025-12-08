@@ -71,6 +71,8 @@ pub struct P2PTransfer {
     shared_files: std::sync::Arc<std::sync::Mutex<Vec<(String, String, u64)>>>, // (name, path, size)
     #[serde(skip)]
     save_directory: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    #[serde(skip)]
+    shareable_url: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 
 }
 
@@ -101,6 +103,7 @@ impl Default for P2PTransfer {
             received_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             shared_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             save_directory: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            shareable_url: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -229,6 +232,56 @@ impl P2PTransfer {
         }
     }
 
+    fn generate_shareable_url(&self, node_id: NodeId) -> String {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(window) = web_sys::window() {
+                if let Ok(location) = window.location().href() {
+                    // Remove existing hash if present
+                    let base_url = location.split('#').next().unwrap_or(&location);
+                    return format!("{}#{}", base_url, node_id);
+                }
+            }
+            // Fallback
+            format!("https://yourapp.com/#{}", node_id)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            format!("https://syncoxiders.app/#{}", node_id)
+        }
+    }
+
+    fn parse_node_id_from_url(&self) -> Option<NodeId> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(window) = web_sys::window() {
+                if let Ok(hash) = window.location().hash() {
+                    if hash.starts_with('#') {
+                        let node_id_str = &hash[1..];
+                        return node_id_str.parse::<NodeId>().ok();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn extract_node_id(&self, input: &str) -> Result<NodeId, String> {
+        if let Ok(node_id) = input.parse::<NodeId>() {
+            return Ok(node_id);
+        }
+
+        if input.contains('#') {
+            if let Some(hash_part) = input.split('#').nth(1) {
+                if let Ok(node_id) = hash_part.parse::<NodeId>() {
+                    return Ok(node_id);
+                }
+            }
+        }
+
+        Err("Invalid node ID or URL format".to_string())
+    }
+
     fn start_accepting(&mut self, ctx: &egui::Context) {
         if self.is_accepting {
             return;
@@ -245,6 +298,7 @@ impl P2PTransfer {
             let node_shared = self.node.clone();
             let logs_shared = self.terminal_logs.clone();
             let shared_files = self.shared_files.clone();
+            let shareable_url_shared = self.shareable_url.clone();
 
             spawn_local(async move {
                 // Read all files from the shared_files list
@@ -273,6 +327,22 @@ impl P2PTransfer {
 
                         if let Ok(mut nid) = node_id_shared.lock() {
                             *nid = Some(node_id);
+                        }
+
+                        // Generate shareable URL
+                        if let Some(window) = web_sys::window() {
+                            if let Ok(location) = window.location().href() {
+                                let base_url = location.split('#').next().unwrap_or(&location);
+                                let share_url = format!("{}#{}", base_url, node_id);
+                                if let Ok(mut url) = shareable_url_shared.lock() {
+                                    *url = Some(share_url.clone());
+                                }
+                                let log_msg = format!("🔗 Shareable URL: {}", share_url);
+                                web_sys::console::log_1(&log_msg.into());
+                                if let Ok(mut logs) = logs_shared.lock() {
+                                    logs.push(log_msg);
+                                }
+                            }
                         }
 
                         // Subscribe to accept events for sender-side logging
@@ -342,6 +412,7 @@ impl P2PTransfer {
             let node_shared = self.node.clone();
             let logs_shared = self.terminal_logs.clone();
             let shared_files = self.shared_files.clone();
+            let shareable_url_shared = self.shareable_url.clone();
 
             tokio::spawn(async move {
                 // Read all files from the shared_files list
@@ -383,6 +454,17 @@ impl P2PTransfer {
 
                         if let Ok(mut nid) = node_id_shared.lock() {
                             *nid = Some(node_id);
+                        }
+
+                        // Generate shareable URL
+                        let share_url = format!("https://syncoxiders.app/#{}", node_id);
+                        if let Ok(mut url) = shareable_url_shared.lock() {
+                            *url = Some(share_url.clone());
+                        }
+                        let log_msg = format!("🔗 Shareable URL: {}", share_url);
+                        println!("{}", log_msg);
+                        if let Ok(mut logs) = logs_shared.lock() {
+                            logs.push(log_msg);
                         }
 
                         // Subscribe to accept events for sender-side logging
@@ -449,17 +531,14 @@ impl P2PTransfer {
     fn stop_accepting(&mut self) {
         self.is_accepting = false;
 
-        // Clear the node (this will drop it and close connections)
         if let Ok(mut node) = self.node.lock() {
             *node = None;
         }
 
-        // Clear the node_id
         if let Ok(mut nid) = self.shared_node_id.lock() {
             *nid = None;
         }
 
-        // Clear picked file info
         if let Ok(mut name) = self.picked_file_name.lock() {
             *name = None;
         }
@@ -537,53 +616,57 @@ impl P2PTransfer {
                                     ctx_clone.request_repaint();
                                 }
                                 crate::node::ConnectEvent::Sent { .. } => {}
-                                crate::node::ConnectEvent::FileStart { file_name, file_size, total_chunks } => {
-                                    web_sys::console::log_1(&format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks).into());
-                                    if let Ok(mut status) = status_shared.lock() {
-                                        *status = format!("Receiving: {} (0%)", file_name);
-                                    }
-                                    current_file = Some((file_name, vec![Vec::new(); total_chunks as usize]));
-                                    ctx_clone.request_repaint();
-                                }
-                                crate::node::ConnectEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset: _ } => {
-                                    if let Some((ref name, ref mut chunks)) = current_file {
-                                        if name == &file_name && (chunk_index as usize) < chunks.len() {
-                                            chunks[chunk_index as usize] = chunk_data;
-                                            web_sys::console::log_1(&format!("  ✓ Chunk {} received", chunk_index).into());
-                                        }
-                                    }
-                                    ctx_clone.request_repaint();
-                                }
-                                crate::node::ConnectEvent::FileComplete { file_name, total_bytes } => {
-                                    web_sys::console::log_1(&format!("✅ File complete: {} ({} bytes)", file_name, total_bytes).into());
-
-                                    // Combine all chunks and trigger download
-                                    if let Some((name, chunks)) = current_file.take() {
-                                        if name == file_name {
-                                            let combined_data: Vec<u8> = chunks.into_iter().flatten().collect();
-
-                                            // Trigger automatic download in browser
-                                            Self::download_file_wasm(&file_name, &combined_data);
-
-                                            let timestamp = js_sys::Date::now() as u64 / 1000;
-                                            let received_file = ReceivedFile {
-                                                name: file_name.clone(),
-                                                size: total_bytes,
-                                                saved_path: "Downloaded to browser".to_string(),
-                                                timestamp: format!("{}", timestamp),
-                                            };
-
-                                            if let Ok(mut files) = received_files_shared.lock() {
-                                                files.push(received_file);
-                                            }
-
+                                crate::node::ConnectEvent::Transfer(transfer_event) => {
+                                    match transfer_event {
+                                        crate::node::TransferEvent::FileStart { file_name, file_size, total_chunks } => {
+                                            web_sys::console::log_1(&format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks).into());
                                             if let Ok(mut status) = status_shared.lock() {
-                                                *status = format!("File downloaded: {}", file_name);
+                                                *status = format!("Receiving: {} (0%)", file_name);
                                             }
+                                            current_file = Some((file_name, vec![Vec::new(); total_chunks as usize]));
+                                            ctx_clone.request_repaint();
+                                        }
+                                        crate::node::TransferEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset: _ } => {
+                                            if let Some((ref name, ref mut chunks)) = current_file {
+                                                if name == &file_name && (chunk_index as usize) < chunks.len() {
+                                                    chunks[chunk_index as usize] = chunk_data;
+                                                    web_sys::console::log_1(&format!("  ✓ Chunk {} received", chunk_index).into());
+                                                }
+                                            }
+                                            ctx_clone.request_repaint();
+                                        }
+                                        crate::node::TransferEvent::FileComplete { file_name, total_bytes } => {
+                                            web_sys::console::log_1(&format!("✅ File complete: {} ({} bytes)", file_name, total_bytes).into());
+
+                                            // Combine all chunks and trigger download
+                                            if let Some((name, chunks)) = current_file.take() {
+                                                if name == file_name {
+                                                    let combined_data: Vec<u8> = chunks.into_iter().flatten().collect();
+
+                                                    // Trigger automatic download in browser
+                                                    Self::download_file_wasm(&file_name, &combined_data);
+
+                                                    let timestamp = js_sys::Date::now() as u64 / 1000;
+                                                    let received_file = ReceivedFile {
+                                                        name: file_name.clone(),
+                                                        size: total_bytes,
+                                                        saved_path: "Downloaded to browser".to_string(),
+                                                        timestamp: format!("{}", timestamp),
+                                                    };
+
+                                                    if let Ok(mut files) = received_files_shared.lock() {
+                                                        files.push(received_file);
+                                                    }
+
+                                                    if let Ok(mut status) = status_shared.lock() {
+                                                        *status = format!("File downloaded: {}", file_name);
+                                                    }
+                                                }
+                                            }
+
+                                            ctx_clone.request_repaint();
                                         }
                                     }
-
-                                    ctx_clone.request_repaint();
                                 }
                                 crate::node::ConnectEvent::Closed { error } => {
                                     let msg = if let Some(err) = &error {
@@ -672,111 +755,115 @@ impl P2PTransfer {
                                 crate::node::ConnectEvent::Sent { .. } => {
                                     // Ignore - this is just the dummy request data
                                 }
-                                crate::node::ConnectEvent::FileStart { file_name, file_size, total_chunks } => {
-                                    let log_msg = format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks);
-                                    println!("{}", log_msg);
+                                crate::node::ConnectEvent::Transfer(transfer_event) => {
+                                    match transfer_event {
+                                        crate::node::TransferEvent::FileStart { file_name, file_size, total_chunks } => {
+                                            let log_msg = format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks);
+                                            println!("{}", log_msg);
 
-                                    if let Ok(mut logs) = logs_shared.lock() {
-                                        logs.push(log_msg.clone());
-                                    }
-                                    if let Ok(mut status) = status_shared.lock() {
-                                        *status = format!("Receiving: {} (0%)", file_name);
-                                    }
-
-                                    // Create/truncate file with the expected size
-                                    if let Ok(save_dir_opt) = save_directory_shared.lock() {
-                                        if let Some(save_dir) = save_dir_opt.as_ref() {
-                                            let file_path = std::path::Path::new(save_dir).join(&file_name);
-                                            // Pre-allocate file with correct size
-                                            if let Err(e) = std::fs::OpenOptions::new()
-                                                .write(true)
-                                                .create(true)
-                                                .truncate(true)
-                                                .open(&file_path)
-                                                .and_then(|f| f.set_len(file_size))
-                                            {
-                                                let err_msg = format!("Error creating file: {}", e);
-                                                println!("{}", err_msg);
-                                                if let Ok(mut logs) = logs_shared.lock() {
-                                                    logs.push(err_msg);
-                                                }
+                                            if let Ok(mut logs) = logs_shared.lock() {
+                                                logs.push(log_msg.clone());
                                             }
-                                        }
-                                    }
-
-                                    ctx_clone.request_repaint();
-                                }
-                                crate::node::ConnectEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset } => {
-                                    // Write chunk at specific offset
-                                    if let Ok(save_dir_opt) = save_directory_shared.lock() {
-                                        if let Some(save_dir) = save_dir_opt.as_ref() {
-                                            let file_path = std::path::Path::new(save_dir).join(&file_name);
-
-                                            use std::io::{Seek, SeekFrom, Write};
-                                            match std::fs::OpenOptions::new()
-                                                .write(true)
-                                                .open(&file_path)
-                                                .and_then(|mut f| {
-                                                    f.seek(SeekFrom::Start(offset))?;
-                                                    f.write_all(&chunk_data)?;
-                                                    Ok(())
-                                                })
-                                            {
-                                                Ok(_) => {
-                                                    let log_msg = format!("  ✓ Chunk {}: {} bytes at offset {}", chunk_index, chunk_data.len(), offset);
-                                                    if let Ok(mut logs) = logs_shared.lock() {
-                                                        logs.push(log_msg);
-                                                    }
-                                                },
-                                                Err(e) => {
-                                                    let err_msg = format!("  ✗ Error writing chunk {}: {}", chunk_index, e);
-                                                    println!("{}", err_msg);
-                                                    if let Ok(mut logs) = logs_shared.lock() {
-                                                        logs.push(err_msg);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    ctx_clone.request_repaint();
-                                }
-                                crate::node::ConnectEvent::FileComplete { file_name, total_bytes } => {
-                                    let log_msg = format!("✅ File complete: {} ({} bytes)", file_name, total_bytes);
-                                    println!("{}", log_msg);
-
-                                    if let Ok(mut logs) = logs_shared.lock() {
-                                        logs.push(log_msg.clone());
-                                    }
-
-                                    // Add to received files list
-                                    if let Ok(save_dir_opt) = save_directory_shared.lock() {
-                                        if let Some(save_dir) = save_dir_opt.as_ref() {
-                                            let file_path = std::path::Path::new(save_dir).join(&file_name);
-                                            let saved_path = file_path.to_string_lossy().to_string();
-
                                             if let Ok(mut status) = status_shared.lock() {
-                                                *status = format!("File saved: {}", file_name);
+                                                *status = format!("Receiving: {} (0%)", file_name);
                                             }
 
-                                            let timestamp = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap()
-                                                .as_secs();
-                                            let received_file = ReceivedFile {
-                                                name: file_name.clone(),
-                                                size: total_bytes,
-                                                saved_path,
-                                                timestamp: format!("{}", timestamp),
-                                            };
-
-                                            if let Ok(mut files) = received_files_shared.lock() {
-                                                files.push(received_file);
+                                            // Create/truncate file with the expected size
+                                            if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                                if let Some(save_dir) = save_dir_opt.as_ref() {
+                                                    let file_path = std::path::Path::new(save_dir).join(&file_name);
+                                                    // Pre-allocate file with correct size
+                                                    if let Err(e) = std::fs::OpenOptions::new()
+                                                        .write(true)
+                                                        .create(true)
+                                                        .truncate(true)
+                                                        .open(&file_path)
+                                                        .and_then(|f| f.set_len(file_size))
+                                                    {
+                                                        let err_msg = format!("Error creating file: {}", e);
+                                                        println!("{}", err_msg);
+                                                        if let Ok(mut logs) = logs_shared.lock() {
+                                                            logs.push(err_msg);
+                                                        }
+                                                    }
+                                                }
                                             }
+
+                                            ctx_clone.request_repaint();
+                                        }
+                                        crate::node::TransferEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset } => {
+                                            // Write chunk at specific offset
+                                            if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                                if let Some(save_dir) = save_dir_opt.as_ref() {
+                                                    let file_path = std::path::Path::new(save_dir).join(&file_name);
+
+                                                    use std::io::{Seek, SeekFrom, Write};
+                                                    match std::fs::OpenOptions::new()
+                                                        .write(true)
+                                                        .open(&file_path)
+                                                        .and_then(|mut f| {
+                                                            f.seek(SeekFrom::Start(offset))?;
+                                                            f.write_all(&chunk_data)?;
+                                                            Ok(())
+                                                        })
+                                                    {
+                                                        Ok(_) => {
+                                                            let log_msg = format!("  ✓ Chunk {}: {} bytes at offset {}", chunk_index, chunk_data.len(), offset);
+                                                            if let Ok(mut logs) = logs_shared.lock() {
+                                                                logs.push(log_msg);
+                                                            }
+                                                        },
+                                                        Err(e) => {
+                                                            let err_msg = format!("  ✗ Error writing chunk {}: {}", chunk_index, e);
+                                                            println!("{}", err_msg);
+                                                            if let Ok(mut logs) = logs_shared.lock() {
+                                                                logs.push(err_msg);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            ctx_clone.request_repaint();
+                                        }
+                                        crate::node::TransferEvent::FileComplete { file_name, total_bytes } => {
+                                            let log_msg = format!("✅ File complete: {} ({} bytes)", file_name, total_bytes);
+                                            println!("{}", log_msg);
+
+                                            if let Ok(mut logs) = logs_shared.lock() {
+                                                logs.push(log_msg.clone());
+                                            }
+
+                                            // Add to received files list
+                                            if let Ok(save_dir_opt) = save_directory_shared.lock() {
+                                                if let Some(save_dir) = save_dir_opt.as_ref() {
+                                                    let file_path = std::path::Path::new(save_dir).join(&file_name);
+                                                    let saved_path = file_path.to_string_lossy().to_string();
+
+                                                    if let Ok(mut status) = status_shared.lock() {
+                                                        *status = format!("File saved: {}", file_name);
+                                                    }
+
+                                                    let timestamp = std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap()
+                                                        .as_secs();
+                                                    let received_file = ReceivedFile {
+                                                        name: file_name.clone(),
+                                                        size: total_bytes,
+                                                        saved_path,
+                                                        timestamp: format!("{}", timestamp),
+                                                    };
+
+                                                    if let Ok(mut files) = received_files_shared.lock() {
+                                                        files.push(received_file);
+                                                    }
+                                                }
+                                            }
+
+                                            ctx_clone.request_repaint();
                                         }
                                     }
-
-                                    ctx_clone.request_repaint();
                                 }
                                 crate::node::ConnectEvent::Closed { error } => {
                                     let log_msg = if let Some(err) = &error {
@@ -885,9 +972,11 @@ impl P2PTransfer {
                     crate::node::ConnectEvent::Sent { .. } => {
                         // Ignore - this is just the dummy request data
                     }
-                    crate::node::ConnectEvent::FileStart { file_name, file_size, total_chunks } => {
-                        let log_msg = format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks);
-                        println!("{}", log_msg);
+                    crate::node::ConnectEvent::Transfer(transfer_event) => {
+                        match transfer_event {
+                            crate::node::TransferEvent::FileStart { file_name, file_size, total_chunks } => {
+                                let log_msg = format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks);
+                                println!("{}", log_msg);
 
                         if let Ok(mut logs) = logs_shared.lock() {
                             logs.push(log_msg.clone());
@@ -927,16 +1016,16 @@ impl P2PTransfer {
                         }
 
                         ctx_clone.request_repaint();
-                    }
-                    crate::node::ConnectEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset } => {
-                        // Check if file already exists in received files
-                        let file_exists = if let Ok(files) = received_files_shared.lock() {
-                            files.iter().any(|f| f.name == file_name)
-                        } else {
-                            false
-                        };
+                            }
+                            crate::node::TransferEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset } => {
+                                // Check if file already exists in received files
+                                let file_exists = if let Ok(files) = received_files_shared.lock() {
+                                    files.iter().any(|f| f.name == file_name)
+                                } else {
+                                    false
+                                };
 
-                        if !file_exists {
+                                if !file_exists {
                             // Write chunk at specific offset
                             if let Ok(save_dir_opt) = save_directory_shared.lock() {
                                 if let Some(save_dir) = save_dir_opt.as_ref() {
@@ -970,18 +1059,18 @@ impl P2PTransfer {
                             }
                         }
 
-                        ctx_clone.request_repaint();
-                    }
-                    crate::node::ConnectEvent::FileComplete { file_name, total_bytes } => {
-                        // Check if file already exists
-                        let file_exists = if let Ok(files) = received_files_shared.lock() {
-                            files.iter().any(|f| f.name == file_name)
-                        } else {
-                            false
-                        };
+                                ctx_clone.request_repaint();
+                            }
+                            crate::node::TransferEvent::FileComplete { file_name, total_bytes } => {
+                                // Check if file already exists
+                                let file_exists = if let Ok(files) = received_files_shared.lock() {
+                                    files.iter().any(|f| f.name == file_name)
+                                } else {
+                                    false
+                                };
 
-                        if !file_exists {
-                            let log_msg = format!("✅ File complete: {} ({} bytes)", file_name, total_bytes);
+                                if !file_exists {
+                                    let log_msg = format!("✅ File complete: {} ({} bytes)", file_name, total_bytes);
                             println!("{}", log_msg);
 
                             if let Ok(mut logs) = logs_shared.lock() {
@@ -1014,13 +1103,15 @@ impl P2PTransfer {
                                     }
                                 }
                             }
-                        } else {
-                            if let Ok(mut status) = status_shared.lock() {
-                                *status = format!("File already exists: {}", file_name);
+                                } else {
+                                    if let Ok(mut status) = status_shared.lock() {
+                                        *status = format!("File already exists: {}", file_name);
+                                    }
+                                }
+
+                                ctx_clone.request_repaint();
                             }
                         }
-
-                        ctx_clone.request_repaint();
                     }
                     crate::node::ConnectEvent::Closed { error } => {
                         let log_msg = if let Some(err) = &error {
@@ -1068,7 +1159,6 @@ impl P2PTransfer {
             status.clear();
         }
 
-        // Clear the node
         if let Ok(mut node) = self.node.lock() {
             *node = None;
         }
@@ -1164,10 +1254,7 @@ impl P2PTransfer {
         }
     }
 
-    // Added this method to fix the missing generate_magnet_uri error
-
     fn add_file_to_share(&mut self, _ctx: &egui::Context) {
-        // Get the currently picked file
         let file_info = {
             let name = self.picked_file_name.lock().ok().and_then(|f| f.clone());
             let path = self.picked_file_path.lock().ok().and_then(|f| f.clone());
@@ -1182,7 +1269,6 @@ impl P2PTransfer {
         let should_restart = self.is_accepting;
 
         if let Some((name, path, size)) = file_info {
-            // Check if file already added
             let mut file_added = false;
             if let Ok(mut files) = self.shared_files.lock() {
                 if !files.iter().any(|(_, p, _)| p == &path) {
@@ -1234,7 +1320,6 @@ impl P2PTransfer {
             }
         }
     }    fn restart_node(&mut self, ctx: &egui::Context) {
-        // Stop current node
         if let Ok(mut node) = self.node.lock() {
             *node = None;
         }
@@ -1248,7 +1333,6 @@ impl P2PTransfer {
 
         #[cfg(not(target_arch = "wasm32"))]
         tokio::spawn(async move {
-            // Small delay to ensure old node is cleaned up
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
             let files_to_share: Vec<(String, Vec<u8>)> = if let Ok(files) = shared_files.lock() {
@@ -1361,9 +1445,8 @@ impl P2PTransfer {
             });
 
             should_restart = self.is_accepting;
-        } // Release lock here
+        }
 
-        // Handle removal after lock is released
         if let Some(index) = to_remove {
             let removed_name = if let Ok(mut files) = self.shared_files.lock() {
                 let removed = files.remove(index);
@@ -1422,7 +1505,6 @@ impl P2PTransfer {
     }
 
     fn show_connection_status(&mut self, ui: &mut Ui) {
-        // Display connection status if accepting
         if self.is_accepting {
             ui.add_space(15.0);
 
@@ -1444,38 +1526,28 @@ impl P2PTransfer {
                             if stop_btn.clicked() {
                                 should_stop = true;
                             }
-
-                            ui.add_space(5.0);
-
-                            let view_btn = ui.add(
-                                Button::new(RichText::new("👁 View Logs").text_style(TextStyle::Button).color(Color32::WHITE))
-                                    .fill(Color32::from_rgb(100, 150, 200))
-                            );
-                            view_btn.clone().on_hover_text("View transfer logs");
-
-                            if view_btn.clicked() {
-                                self.show_terminal_view = !self.show_terminal_view;
-                            }
                         });
                     });
 
-                    // Check if node_id is available
-                    if let Ok(node_id_opt) = self.shared_node_id.lock() {
-                        if let Some(node_id) = *node_id_opt {
+                    // Check if shareable URL is available
+                    if let Ok(url_opt) = self.shareable_url.lock() {
+                        if let Some(share_url) = url_opt.as_ref() {
                             ui.add_space(8.0);
                             ui.separator();
                             ui.add_space(8.0);
 
-                            ui.label(RichText::new("Node Hash:").strong());
+                            ui.label(RichText::new("📤 Shareable Link:").strong());
                             ui.add_space(5.0);
 
-                            let node_hash = format!("{}", node_id);
-                            ui.label(RichText::new(&node_hash).code());
-                            ui.add_space(5.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(share_url).code());
+                                if ui.button(RichText::new("📋 Copy Link").color(Color32::WHITE)).clicked() {
+                                    ui.ctx().copy_text(share_url.clone());
+                                }
+                            });
 
-                            if ui.button(RichText::new("📋 Copy Hash").color(Color32::WHITE)).clicked() {
-                                ui.ctx().copy_text(node_hash);
-                            }
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("💡 Share this link with anyone to send files!").italics().color(Color32::GRAY));
                         } else {
                             ui.add_space(5.0);
                             ui.label("Initializing node...");
@@ -1492,7 +1564,6 @@ impl P2PTransfer {
     }
 
     fn show_file_info(&mut self, ui: &mut Ui) {
-        // Scope the mutex locks to extract data and drop guards early
         let (name, path, size) = {
             let file_name_binding = self.picked_file_name.lock().ok();
             let file_path_binding = self.picked_file_path.lock().ok();
@@ -1516,11 +1587,6 @@ impl P2PTransfer {
                 }
             }
         };
-
-        // Generate magnet URI before entering the closure
-        // if let Some(magnet_uri) = self.generate_magnet_uri(&path) {
-        //     self.magnet_input = magnet_uri;
-        // }
 
         ui.add_space(15.0);
         ui.group(|ui| {
@@ -1579,18 +1645,6 @@ impl P2PTransfer {
                     if self.is_accepting {
                         ui.add_space(5.0);
 
-                        let view_btn = ui.add(
-                            Button::new(RichText::new("👁 View Logs").text_style(TextStyle::Button).color(Color32::WHITE))
-                                .fill(Color32::from_rgb(100, 150, 200))
-                        );
-                        view_btn.clone().on_hover_text("View terminal logs");
-
-                        if view_btn.clicked() {
-                            self.show_terminal_view = !self.show_terminal_view;
-                        }
-
-                        ui.add_space(5.0);
-
                         let stop_btn = ui.add(
                             Button::new(RichText::new("⏹ Stop").text_style(TextStyle::Button).color(Color32::WHITE))
                                 .fill(Color32::from_rgb(200, 100, 100))
@@ -1630,6 +1684,14 @@ impl eframe::App for P2PTransfer {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_arch = "wasm32")]
+        if !self.show_receive_dialog && !self.is_accepting {
+            if let Some(node_id) = self.parse_node_id_from_url() {
+                self.show_receive_dialog = true;
+                self.receive_hash_input = format!("{}", node_id);
+            }
+        }
+
         let frame = egui::containers::Frame::new()
             .fill(ctx.style().visuals.window_fill)
             .inner_margin(20.0)
@@ -1660,21 +1722,17 @@ impl eframe::App for P2PTransfer {
                 ui.add_space(4.0);
             });
 
-        egui::CentralPanel::default()
-            .frame(frame)
+        // Controls Panel at the top
+        egui::TopBottomPanel::top("controls_panel")
+            .frame(frame.clone())
             .show(ctx, |ui| {
-                let available_height = ui.available_height() - 30.0; // Reserve space for footer
+                ui.vertical_centered(|ui| {
+                    ui.heading(RichText::new("P2P File Sharing").size(24.0));
+                    ui.label("Easily share files with a secure peer-to-peer connection");
+                    ui.add_space(5.0);
+                });
 
-                egui::ScrollArea::vertical()
-                    .max_height(available_height)
-                    .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.heading(RichText::new("P2P File Sharing").size(24.0));
-                        ui.label("Easily share files with a secure peer-to-peer connection");
-                        ui.add_space(5.0);
-                    });
-
-                    ui.horizontal_centered(|ui| {
+                ui.horizontal_centered(|ui| {
                     let btn = ui.add_sized(
                         Vec2::new(200.0, 40.0),
                         egui::Button::new(RichText::new("Choose File").size(16.0).color(Color32::WHITE))
@@ -1700,6 +1758,65 @@ impl eframe::App for P2PTransfer {
                         self.show_receive_dialog = !self.show_receive_dialog;
                     }
                 });
+                ui.add_space(5.0);
+            });
+
+        // Terminal Panel at the bottom (1/3 of screen height)
+        let terminal_height = ctx.screen_rect().height() / 3.0;
+        let terminal_frame = egui::containers::Frame::new()
+            .fill(ctx.style().visuals.window_fill)
+            .inner_margin(20.0)
+            .stroke(ctx.style().visuals.widgets.noninteractive.bg_stroke);
+
+        egui::TopBottomPanel::bottom("terminal_panel")
+            .frame(terminal_frame)
+            .resizable(false)
+            .exact_height(terminal_height)
+            .show(ctx, |ui| {
+                ui.set_width(ui.available_width());
+                ui.heading(RichText::new("📟 Terminal Logs").size(18.0));
+                ui.add_space(5.0);
+                ui.separator();
+                ui.add_space(5.0);
+
+                // Fixed height scrollable area for logs
+                let scroll_height = terminal_height - 100.0; // Reserve space for header and buttons
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .max_height(scroll_height)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if let Ok(logs) = self.terminal_logs.lock() {
+                            if logs.is_empty() {
+                                ui.label(RichText::new("No logs yet...").italics().color(Color32::GRAY));
+                            } else {
+                                for log in logs.iter() {
+                                    ui.horizontal(|ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(RichText::new(log).code());
+                                    });
+                                }
+                            }
+                        } else {
+                            ui.label(RichText::new("Error accessing logs").color(Color32::RED));
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Clear").clicked() {
+                        if let Ok(mut logs) = self.terminal_logs.lock() {
+                            logs.clear();
+                        }
+                    }
+                });
+            });
+
+        egui::CentralPanel::default()
+            .frame(frame)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .show(ui, |ui| {
 
                 // Show receive section if active
                 if self.show_receive_dialog {
@@ -1750,11 +1867,11 @@ impl eframe::App for P2PTransfer {
 
                             ui.add_space(10.0);
 
-                            ui.label(RichText::new("Enter the node hash to connect:").strong());
+                            ui.label(RichText::new("Enter the shareable link or node hash:").strong());
                             ui.add_space(10.0);
 
                             ui.horizontal(|ui| {
-                                ui.label("Hash:");
+                                ui.label("Link/Hash:");
                                 ui.text_edit_singleline(&mut self.receive_hash_input);
                             });
 
@@ -1785,11 +1902,14 @@ impl eframe::App for P2PTransfer {
                                     }
 
                                     if connect_btn.clicked() {
-                                        if let Ok(node_id) = self.receive_hash_input.parse::<NodeId>() {
-                                            self.start_receiving(ctx, node_id);
-                                        } else {
-                                            if let Ok(mut status) = self.receive_status.lock() {
-                                                *status = "Invalid hash format".to_string();
+                                        match self.extract_node_id(&self.receive_hash_input) {
+                                            Ok(node_id) => {
+                                                self.start_receiving(ctx, node_id);
+                                            }
+                                            Err(err) => {
+                                                if let Ok(mut status) = self.receive_status.lock() {
+                                                    *status = err;
+                                                }
                                             }
                                         }
                                     }
@@ -1809,21 +1929,9 @@ impl eframe::App for P2PTransfer {
                                     refresh_btn.clone().on_hover_text("Check for new files from sender");
 
                                     if refresh_btn.clicked() {
-                                        if let Ok(node_id) = self.receive_hash_input.parse::<NodeId>() {
+                                        if let Ok(node_id) = self.extract_node_id(&self.receive_hash_input) {
                                             self.reconnect_for_files(ctx, node_id);
                                         }
-                                    }
-
-                                    ui.add_space(5.0);
-
-                                    let view_btn = ui.add(
-                                        Button::new(RichText::new("👁 View Logs").text_style(TextStyle::Button).color(Color32::WHITE))
-                                            .fill(Color32::from_rgb(100, 150, 200))
-                                    );
-                                    view_btn.clone().on_hover_text("View terminal logs");
-
-                                    if view_btn.clicked() {
-                                        self.show_terminal_view = !self.show_terminal_view;
                                     }
 
                                     ui.add_space(5.0);
@@ -1853,61 +1961,7 @@ impl eframe::App for P2PTransfer {
 
                 // Show received files section
                 self.show_received_files(ui);
-                });
-
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0;
-                        ui.label("Powered by ");
-                        ui.hyperlink_to("Syncoxiders", "https://github.com/emilk/eframe_template");
-                        ui.label(" • ");
-                        ui.hyperlink_to(
-                            "Source code",
-                            "https://github.com/emilk/eframe_template/blob/main/",
-                        );
                     });
-                    egui::warn_if_debug_build(ui);
-                });
             });
-
-        // Terminal view window
-        egui::Window::new("📟 Terminal Logs")
-            .resizable(true)
-            .default_width(600.0)
-            .default_height(400.0)
-            .open(&mut self.show_terminal_view)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        if let Ok(logs) = self.terminal_logs.lock() {
-                            if logs.is_empty() {
-                                ui.label(RichText::new("No logs yet...").italics().color(Color32::GRAY));
-                            } else {
-                                for log in logs.iter() {
-                                    ui.label(RichText::new(log).code());
-                                }
-                            }
-                        } else {
-                            ui.label(RichText::new("Error accessing logs").color(Color32::RED));
-                        }
-                    });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Clear").clicked() {
-                        if let Ok(mut logs) = self.terminal_logs.lock() {
-                            logs.clear();
-                        }
-                    }
-                });
-            });
-
-        // egui::CentralPanel::default()
-        // .frame(frame)
-        // .show(ctx, |ui| {
-        //     ui.label("Iroh node working");
-        // });
-
     }
 }
