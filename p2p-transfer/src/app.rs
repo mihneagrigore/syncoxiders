@@ -5,21 +5,21 @@ use crate::node::EchoNode;
 use iroh::NodeId;
 
 #[derive(Debug, Clone)]
-struct ReceivedFile {
-    name: String,
-    size: u64,
-    saved_path: String,
-    timestamp: String,
+pub struct ReceivedFile {
+    pub name: String,
+    pub size: u64,
+    pub saved_path: String,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct TorrentInfo{
-    magnet_uri : Option<String>,
-    download_progress: f32,
-    peers_count: usize,
-    is_download: bool,
-    is_seeding: bool,
-    download_complete: bool
+pub struct TorrentInfo{
+    pub magnet_uri : Option<String>,
+    pub download_progress: f32,
+    pub peers_count: usize,
+    pub is_download: bool,
+    pub is_seeding: bool,
+    pub download_complete: bool
 }
 
 #[derive(Deserialize, Serialize)]
