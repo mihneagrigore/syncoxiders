@@ -1,3 +1,5 @@
+// Run with cargo test
+
 use crate::node::{EchoNode, ConnectEvent, TransferEvent};
 use crate::app::{P2PTransfer, TorrentInfo, ReceivedFile};
 use tokio::time::{timeout, Duration};
