@@ -69,6 +69,9 @@ pub struct P2PTransfer {
     received_files: std::sync::Arc<std::sync::Mutex<Vec<ReceivedFile>>>,
     #[serde(skip)]
     shared_files: std::sync::Arc<std::sync::Mutex<Vec<(String, String, u64)>>>, // (name, path, size)
+    #[cfg(target_arch = "wasm32")]
+    #[serde(skip)]
+    shared_files_data: std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>, // (name, data) for WASM
     #[serde(skip)]
     save_directory: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     #[serde(skip)]
@@ -102,6 +105,8 @@ impl Default for P2PTransfer {
             show_terminal_view: false,
             received_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             shared_files: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(target_arch = "wasm32")]
+            shared_files_data: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             save_directory: std::sync::Arc::new(std::sync::Mutex::new(None)),
             shareable_url: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
@@ -297,23 +302,22 @@ impl P2PTransfer {
             let node_id_shared = self.shared_node_id.clone();
             let node_shared = self.node.clone();
             let logs_shared = self.terminal_logs.clone();
-            let shared_files = self.shared_files.clone();
+            let shared_files_data = self.shared_files_data.clone();
             let shareable_url_shared = self.shareable_url.clone();
 
             spawn_local(async move {
-                // Read all files from the shared_files list
-                let files_to_share: Vec<(String, Vec<u8>)> = if let Ok(files) = shared_files.lock() {
-                    // For WASM, we need to get file data from memory
-                    // Files are stored when picked via the file input
-                    files.iter().filter_map(|(name, _path, _size)| {
-                        // In WASM, the "path" is just the name, and we don't have direct file access
-                        // Files should be stored in memory when picked
-                        // For now, return empty vec - this will be populated when we add files
-                        None
-                    }).collect()
+                // Read all files from the shared_files_data list
+                let files_to_share: Vec<(String, Vec<u8>)> = if let Ok(files_data) = shared_files_data.lock() {
+                    files_data.clone()
                 } else {
                     Vec::new()
                 };
+
+                if files_to_share.is_empty() {
+                    web_sys::console::log_1(&"⚠️ No files added to share. Please add files first.".into());
+                } else {
+                    web_sys::console::log_1(&format!("📦 Sharing {} file(s)", files_to_share.len()).into());
+                }
 
                 match EchoNode::spawn_with_files(files_to_share).await {
                     Ok(node) => {
@@ -550,7 +554,12 @@ impl P2PTransfer {
         }
 
         #[cfg(target_arch = "wasm32")]
-        web_sys::console::log_1(&"Stopped accepting connections".into());
+        {
+            if let Ok(mut data) = self.picked_file_data.lock() {
+                *data = None;
+            }
+            web_sys::console::log_1(&"Stopped accepting connections".into());
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1144,8 +1153,153 @@ impl P2PTransfer {
 
         #[cfg(target_arch = "wasm32")]
         {
-            // For WASM, we'd need to implement a similar reconnection
-            web_sys::console::log_1(&"Refresh not yet implemented for WASM".into());
+            use wasm_bindgen_futures::spawn_local;
+            use n0_future::StreamExt;
+
+            let received_files_shared = self.received_files.clone();
+
+            spawn_local(async move {
+                web_sys::console::log_1(&format!("Refreshing files from node: {}", target_node_id).into());
+
+                // Get a reference to the node and connect
+                let node_ref = node_shared.clone();
+                let events = {
+                    let node_guard = node_ref.lock();
+                    if node_guard.is_err() {
+                        web_sys::console::log_1(&"Failed to lock node".into());
+                        return;
+                    }
+                    let node_guard = node_guard.unwrap();
+                    if node_guard.is_none() {
+                        web_sys::console::log_1(&"Node not initialized".into());
+                        return;
+                    }
+                    let node = node_guard.as_ref().unwrap();
+
+                    let dummy_data = b"SEND_FILE".to_vec();
+                    node.connect(target_node_id, dummy_data, "request".to_string())
+                };
+
+                let mut events = events;
+                let mut current_file: Option<(String, Vec<Vec<u8>>)> = None;
+
+                // Process connection events
+                while let Some(event) = events.next().await {
+                    match event {
+                        crate::node::ConnectEvent::Connected => {
+                            web_sys::console::log_1(&"✓ Reconnected! Fetching files...".into());
+                            if let Ok(mut status) = status_shared.lock() {
+                                *status = "Fetching files...".to_string();
+                            }
+                            ctx_clone.request_repaint();
+                        }
+                        crate::node::ConnectEvent::Sent { .. } => {
+                            // Ignore - this is just the dummy request data
+                        }
+                        crate::node::ConnectEvent::Transfer(transfer_event) => {
+                            match transfer_event {
+                                crate::node::TransferEvent::FileStart { file_name, file_size, total_chunks } => {
+                                    web_sys::console::log_1(&format!("📥 Starting file: {} ({} bytes, {} chunks)", file_name, file_size, total_chunks).into());
+
+                                    if let Ok(mut status) = status_shared.lock() {
+                                        *status = format!("Receiving: {} (0%)", file_name);
+                                    }
+
+                                    // Check if file already exists
+                                    let file_exists = if let Ok(files) = received_files_shared.lock() {
+                                        files.iter().any(|f| f.name == file_name)
+                                    } else {
+                                        false
+                                    };
+
+                                    if !file_exists {
+                                        current_file = Some((file_name, vec![Vec::new(); total_chunks as usize]));
+                                    } else {
+                                        web_sys::console::log_1(&format!("File already exists: {}", file_name).into());
+                                    }
+
+                                    ctx_clone.request_repaint();
+                                }
+                                crate::node::TransferEvent::ChunkReceived { file_name, chunk_index, chunk_data, offset: _ } => {
+                                    if let Some((ref name, ref mut chunks)) = current_file {
+                                        if name == &file_name && (chunk_index as usize) < chunks.len() {
+                                            chunks[chunk_index as usize] = chunk_data;
+                                            web_sys::console::log_1(&format!("  ✓ Chunk {} received", chunk_index).into());
+                                        }
+                                    }
+                                    ctx_clone.request_repaint();
+                                }
+                                crate::node::TransferEvent::FileComplete { file_name, total_bytes } => {
+                                    // Check if file already exists
+                                    let file_exists = if let Ok(files) = received_files_shared.lock() {
+                                        files.iter().any(|f| f.name == file_name)
+                                    } else {
+                                        false
+                                    };
+
+                                    if !file_exists {
+                                        web_sys::console::log_1(&format!("✅ File complete: {} ({} bytes)", file_name, total_bytes).into());
+
+                                        // Combine all chunks and trigger download
+                                        if let Some((name, chunks)) = current_file.take() {
+                                            if name == file_name {
+                                                let combined_data: Vec<u8> = chunks.into_iter().flatten().collect();
+
+                                                // Trigger automatic download in browser
+                                                Self::download_file_wasm(&file_name, &combined_data);
+
+                                                let timestamp = js_sys::Date::now() as u64 / 1000;
+                                                let received_file = ReceivedFile {
+                                                    name: file_name.clone(),
+                                                    size: total_bytes,
+                                                    saved_path: "Downloaded to browser".to_string(),
+                                                    timestamp: format!("{}", timestamp),
+                                                };
+
+                                                if let Ok(mut files) = received_files_shared.lock() {
+                                                    files.push(received_file);
+                                                }
+
+                                                if let Ok(mut status) = status_shared.lock() {
+                                                    *status = format!("File downloaded: {}", file_name);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        if let Ok(mut status) = status_shared.lock() {
+                                            *status = format!("File already exists: {}", file_name);
+                                        }
+                                    }
+
+                                    ctx_clone.request_repaint();
+                                }
+                            }
+                        }
+                        crate::node::ConnectEvent::Closed { error } => {
+                            let msg = if let Some(err) = &error {
+                                format!("✗ Connection closed with error: {}", err)
+                            } else {
+                                "✓ Refresh complete!".to_string()
+                            };
+                            web_sys::console::log_1(&msg.into());
+
+                            if let Some(err) = error {
+                                if let Ok(mut status) = status_shared.lock() {
+                                    *status = format!("Error: {}", err);
+                                }
+                            } else {
+                                if let Ok(mut status) = status_shared.lock() {
+                                    *status = "Connected! Files up to date.".to_string();
+                                }
+                            }
+                            ctx_clone.request_repaint();
+                            break;
+                        }
+                    }
+                }
+
+                ctx_clone.request_repaint();
+            });
         }
     }
 
@@ -1259,7 +1413,15 @@ impl P2PTransfer {
             let name = self.picked_file_name.lock().ok().and_then(|f| f.clone());
             let path = self.picked_file_path.lock().ok().and_then(|f| f.clone());
             let size = self.picked_file_size.lock().ok().and_then(|f| f.clone());
+            #[cfg(target_arch = "wasm32")]
+            let data = self.picked_file_data.lock().ok().and_then(|f| f.clone());
 
+            #[cfg(target_arch = "wasm32")]
+            match (name, path, size, data) {
+                (Some(n), Some(p), Some(s), Some(d)) => Some((n, p, s, d)),
+                _ => None
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             match (name, path, size) {
                 (Some(n), Some(p), Some(s)) => Some((n, p, s)),
                 _ => None
@@ -1268,6 +1430,55 @@ impl P2PTransfer {
 
         let should_restart = self.is_accepting;
 
+        #[cfg(target_arch = "wasm32")]
+        if let Some((name, path, size, data)) = file_info {
+            let mut file_added = false;
+            if let Ok(mut files) = self.shared_files.lock() {
+                if !files.iter().any(|(_, p, _)| p == &path) {
+                    files.push((name.clone(), path.clone(), size));
+                    file_added = true;
+                }
+            }
+
+            // Store the actual file data for WASM
+            if file_added {
+                if let Ok(mut files_data) = self.shared_files_data.lock() {
+                    if !files_data.iter().any(|(n, _)| n == &name) {
+                        files_data.push((name.clone(), data.clone()));
+                        web_sys::console::log_1(&format!("Added file to share: {} ({} bytes)", name, data.len()).into());
+                    }
+                }
+
+                // If node is running, update its file list directly
+                if should_restart {
+                    if let Ok(node_guard) = self.node.lock() {
+                        if let Some(node) = node_guard.as_ref() {
+                            let node_files = node.get_shared_files();
+                            if let Ok(mut nf) = node_files.lock() {
+                                nf.push((name.clone(), data));
+                                web_sys::console::log_1(&format!("Updated running node with file: {}", name).into());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Clear the picked file
+            if let Ok(mut name) = self.picked_file_name.lock() {
+                *name = None;
+            }
+            if let Ok(mut path) = self.picked_file_path.lock() {
+                *path = None;
+            }
+            if let Ok(mut size) = self.picked_file_size.lock() {
+                *size = None;
+            }
+            if let Ok(mut data) = self.picked_file_data.lock() {
+                *data = None;
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some((name, path, size)) = file_info {
             let mut file_added = false;
             if let Ok(mut files) = self.shared_files.lock() {
@@ -1275,7 +1486,6 @@ impl P2PTransfer {
                     files.push((name.clone(), path.clone(), size));
                     file_added = true;
 
-                    #[cfg(not(target_arch = "wasm32"))]
                     if let Ok(mut logs) = self.terminal_logs.lock() {
                         logs.push(format!("Added file to share: {}", name));
                     }
@@ -1287,22 +1497,13 @@ impl P2PTransfer {
                 if let Ok(node_guard) = self.node.lock() {
                     if let Some(node) = node_guard.as_ref() {
                         let node_files = node.get_shared_files();
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            if let Ok(data) = std::fs::read(&path) {
-                                if let Ok(mut nf) = node_files.lock() {
-                                    nf.push((name.clone(), data));
-                                    if let Ok(mut logs) = self.terminal_logs.lock() {
-                                        logs.push(format!("Updated running node with file: {}", name));
-                                    }
+                        if let Ok(data) = std::fs::read(&path) {
+                            if let Ok(mut nf) = node_files.lock() {
+                                nf.push((name.clone(), data));
+                                if let Ok(mut logs) = self.terminal_logs.lock() {
+                                    logs.push(format!("Updated running node with file: {}", name));
                                 }
                             }
-                        }
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            // For WASM, file data should be in picked_file_data
-                            // This needs special handling since we can't read from filesystem
-                            web_sys::console::log_1(&"WASM: Cannot update running node file list directly".into());
                         }
                     }
                 }
@@ -1329,56 +1530,103 @@ impl P2PTransfer {
         let node_id_shared = self.shared_node_id.clone();
         let node_shared = self.node.clone();
         let logs_shared = self.terminal_logs.clone();
-        let shared_files = self.shared_files.clone();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen_futures::spawn_local;
+            let shared_files_data = self.shared_files_data.clone();
+
+            spawn_local(async move {
+                // Small delay before restart
+                let promise = js_sys::Promise::new(&mut |resolve, _| {
+                    web_sys::window()
+                        .unwrap()
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100)
+                        .unwrap();
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+
+                let files_to_share: Vec<(String, Vec<u8>)> = if let Ok(files_data) = shared_files_data.lock() {
+                    files_data.clone()
+                } else {
+                    Vec::new()
+                };
+
+                match EchoNode::spawn_with_files(files_to_share).await {
+                    Ok(node) => {
+                        let node_id = node.endpoint().node_id();
+
+                        if let Ok(mut nid) = node_id_shared.lock() {
+                            *nid = Some(node_id);
+                        }
+
+                        if let Ok(mut n) = node_shared.lock() {
+                            *n = Some(node);
+                        }
+
+                        web_sys::console::log_1(&"Node restarted with updated files".into());
+
+                        ctx_clone.request_repaint();
+                    }
+                    Err(e) => {
+                        web_sys::console::log_1(&format!("Failed to restart node: {}", e).into());
+                    }
+                }
+            });
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        {
+            let shared_files = self.shared_files.clone();
 
-            let files_to_share: Vec<(String, Vec<u8>)> = if let Ok(files) = shared_files.lock() {
-                let mut result = Vec::new();
-                for (name, path, _size) in files.iter() {
-                    match std::fs::read(path) {
-                        Ok(data) => {
-                            result.push((name.clone(), data));
-                        }
-                        Err(e) => {
-                            if let Ok(mut logs) = logs_shared.lock() {
-                                logs.push(format!("Failed to read file {}: {}", name, e));
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                let files_to_share: Vec<(String, Vec<u8>)> = if let Ok(files) = shared_files.lock() {
+                    let mut result = Vec::new();
+                    for (name, path, _size) in files.iter() {
+                        match std::fs::read(path) {
+                            Ok(data) => {
+                                result.push((name.clone(), data));
+                            }
+                            Err(e) => {
+                                if let Ok(mut logs) = logs_shared.lock() {
+                                    logs.push(format!("Failed to read file {}: {}", name, e));
+                                }
                             }
                         }
                     }
+                    result
+                } else {
+                    Vec::new()
+                };
+
+                match EchoNode::spawn_with_files(files_to_share).await {
+                    Ok(node) => {
+                        let node_id = node.endpoint().node_id();
+
+                        if let Ok(mut nid) = node_id_shared.lock() {
+                            *nid = Some(node_id);
+                        }
+
+                        if let Ok(mut n) = node_shared.lock() {
+                            *n = Some(node);
+                        }
+
+                        if let Ok(mut logs) = logs_shared.lock() {
+                            logs.push("Node restarted with updated files".to_string());
+                        }
+
+                        ctx_clone.request_repaint();
+                    }
+                    Err(e) => {
+                        if let Ok(mut logs) = logs_shared.lock() {
+                            logs.push(format!("Failed to restart node: {}", e));
+                        }
+                    }
                 }
-                result
-            } else {
-                Vec::new()
-            };
-
-            match EchoNode::spawn_with_files(files_to_share).await {
-                Ok(node) => {
-                    let node_id = node.endpoint().node_id();
-
-                    if let Ok(mut nid) = node_id_shared.lock() {
-                        *nid = Some(node_id);
-                    }
-
-                    if let Ok(mut n) = node_shared.lock() {
-                        *n = Some(node);
-                    }
-
-                    if let Ok(mut logs) = logs_shared.lock() {
-                        logs.push("Node restarted with updated files".to_string());
-                    }
-
-                    ctx_clone.request_repaint();
-                }
-                Err(e) => {
-                    if let Ok(mut logs) = logs_shared.lock() {
-                        logs.push(format!("Failed to restart node: {}", e));
-                    }
-                }
-            }
-        });
+            });
+        }
     }
 
     fn show_shared_files(&mut self, ui: &mut Ui, ctx: &egui::Context) {
@@ -1461,6 +1709,15 @@ impl P2PTransfer {
                 None
             };
 
+            // Also remove from WASM data storage
+            #[cfg(target_arch = "wasm32")]
+            if let Some(ref name) = removed_name {
+                if let Ok(mut files_data) = self.shared_files_data.lock() {
+                    files_data.retain(|(n, _)| n != name);
+                    web_sys::console::log_1(&format!("Removed file from shared list: {}", name).into());
+                }
+            }
+
             // If node is running, update its file list directly
             if should_restart && removed_name.is_some() {
                 let node_files = if let Ok(node_guard) = self.node.lock() {
@@ -1473,25 +1730,30 @@ impl P2PTransfer {
                     if let Ok(mut nf) = node_files.lock() {
                         // Rebuild the file list from shared_files
                         nf.clear();
-                        if let Ok(shared) = self.shared_files.lock() {
-                            for (name, path, _size) in shared.iter() {
-                                #[cfg(not(target_arch = "wasm32"))]
-                                {
+
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            if let Ok(files_data) = self.shared_files_data.lock() {
+                                for (name, data) in files_data.iter() {
+                                    nf.push((name.clone(), data.clone()));
+                                }
+                            }
+                            web_sys::console::log_1(&format!("Updated running node - removed: {}", removed_name.unwrap()).into());
+                        }
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            if let Ok(shared) = self.shared_files.lock() {
+                                for (name, path, _size) in shared.iter() {
                                     if let Ok(data) = std::fs::read(path) {
                                         nf.push((name.clone(), data));
                                     }
                                 }
-                                #[cfg(target_arch = "wasm32")]
-                                {
-                                    // For WASM, we'd need to store the data separately
-                                    // This is a limitation - might need restart on WASM
-                                }
                             }
-                        }
 
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if let Ok(mut logs) = self.terminal_logs.lock() {
-                            logs.push(format!("Updated running node - removed: {}", removed_name.unwrap()));
+                            if let Ok(mut logs) = self.terminal_logs.lock() {
+                                logs.push(format!("Updated running node - removed: {}", removed_name.unwrap()));
+                            }
                         }
                     }
                 }
