@@ -149,10 +149,42 @@ impl P2PTransfer {
 
         self.file_input_closure = None;
 
-        let document = web_sys::window().unwrap().document().unwrap();
+        let window = match web_sys::window() {
+            Some(w) => w,
+            None => {
+                web_sys::console::error_1(&"Failed to get window object".into());
+                return;
+            }
+        };
 
-        let input = document.create_element("input").unwrap().dyn_into::<HtmlInputElement>().unwrap();
-        input.set_attribute("type", "file").unwrap();
+        let document = match window.document() {
+            Some(d) => d,
+            None => {
+                web_sys::console::error_1(&"Failed to get document object".into());
+                return;
+            }
+        };
+
+        let input_elem = match document.create_element("input") {
+            Ok(e) => e,
+            Err(_e) => {
+                web_sys::console::error_1(&format!("Failed to create input element: {:?}", _e).into());
+                return;
+            }
+        };
+
+        let input: HtmlInputElement = match input_elem.dyn_into() {
+            Ok(i) => i,
+            Err(_e) => {
+                web_sys::console::error_1(&format!("Failed to cast to HtmlInputElement: {:?}", _e).into());
+                return;
+            }
+        };
+
+        if let Err(_e) = input.set_attribute("type", "file") {
+            web_sys::console::error_1(&format!("Failed to set input type: {:?}", _e).into());
+            return;
+        }
 
         let ctx_clone = ctx.clone();
         let shared_filename = self.picked_file_name.clone();
@@ -161,7 +193,21 @@ impl P2PTransfer {
         let shared_filedata = self.picked_file_data.clone();
 
         let closure = wasm_bindgen::closure::Closure::wrap(Box::new(move |event: Event| {
-            let input = event.target().unwrap().dyn_into::<HtmlInputElement>().unwrap();
+            let target = match event.target() {
+                Some(t) => t,
+                None => {
+                    web_sys::console::error_1(&"Event target is None".into());
+                    return;
+                }
+            };
+
+            let input: HtmlInputElement = match target.dyn_into() {
+                Ok(i) => i,
+                Err(_e) => {
+                    web_sys::console::error_1(&format!("Failed to cast event target: {:?}", _e).into());
+                    return;
+                }
+            };
 
             if let Some(files) = input.files() {
                 if let Some(file) = files.get(0) {
@@ -172,7 +218,13 @@ impl P2PTransfer {
                     web_sys::console::log_1(&format!("Picked file: {} ({} bytes)", name, size).into());
 
                     // Read file data
-                    let reader = FileReader::new().unwrap();
+                    let reader = match FileReader::new() {
+                        Ok(r) => r,
+                        Err(_e) => {
+                            web_sys::console::error_1(&format!("Failed to create FileReader: {:?}", _e).into());
+                            return;
+                        }
+                    };
                     let reader_clone = reader.clone();
                     let name_clone = name.clone();
                     let ctx_clone2 = ctx_clone.clone();
@@ -189,18 +241,22 @@ impl P2PTransfer {
 
                                 web_sys::console::log_1(&format!("File data read: {} bytes", data.len()).into());
 
-                                // Update shared states
-                                if let Ok(mut filename) = shared_filename2.lock() {
-                                    *filename = Some(name_clone.clone());
+                                // Update shared states with error logging
+                                match shared_filename2.lock() {
+                                    Ok(mut filename) => *filename = Some(name_clone.clone()),
+                                    Err(_e) => web_sys::console::error_1(&format!("Failed to lock filename: {:?}", _e).into()),
                                 }
-                                if let Ok(mut filepath) = shared_filepath2.lock() {
-                                    *filepath = Some(name_clone.clone());
+                                match shared_filepath2.lock() {
+                                    Ok(mut filepath) => *filepath = Some(name_clone.clone()),
+                                    Err(_e) => web_sys::console::error_1(&format!("Failed to lock filepath: {:?}", _e).into()),
                                 }
-                                if let Ok(mut filesize) = shared_filesize2.lock() {
-                                    *filesize = Some(data.len() as u64);
+                                match shared_filesize2.lock() {
+                                    Ok(mut filesize) => *filesize = Some(data.len() as u64),
+                                    Err(_e) => web_sys::console::error_1(&format!("Failed to lock filesize: {:?}", _e).into()),
                                 }
-                                if let Ok(mut filedata) = shared_filedata2.lock() {
-                                    *filedata = Some(data);
+                                match shared_filedata2.lock() {
+                                    Ok(mut filedata) => *filedata = Some(data),
+                                    Err(_e) => web_sys::console::error_1(&format!("Failed to lock filedata: {:?}", _e).into()),
                                 }
 
                                 ctx_clone2.request_repaint();
@@ -543,6 +599,22 @@ impl P2PTransfer {
 
         if let Ok(mut nid) = self.shared_node_id.lock() {
             *nid = None;
+        }
+
+        // Clear shareable URL
+        if let Ok(mut url) = self.shareable_url.lock() {
+            *url = None;
+        }
+
+        // Clear shared files list
+        if let Ok(mut files) = self.shared_files.lock() {
+            files.clear();
+        }
+
+        // Clear shared files data to prevent memory accumulation
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(mut files_data) = self.shared_files_data.lock() {
+            files_data.clear();
         }
 
         if let Ok(mut name) = self.picked_file_name.lock() {
@@ -948,12 +1020,31 @@ impl P2PTransfer {
             // Get a reference to the node and connect
             let node_ref = node_shared.clone();
             let events = {
-                let node_guard = node_ref.lock();
-                if node_guard.is_err() {
-                    return;
-                }
-                let node_guard = node_guard.unwrap();
+                let node_guard = match node_ref.lock() {
+                    Ok(guard) => guard,
+                    Err(_e) => {
+                        let error_msg = format!("Failed to lock node: {:?}", _e);
+                        println!("{}", error_msg);
+                        if let Ok(mut logs) = logs_shared.lock() {
+                            logs.push(error_msg);
+                        }
+                        if let Ok(mut status) = status_shared.lock() {
+                            *status = "Error: Failed to access node".to_string();
+                        }
+                        ctx_clone.request_repaint();
+                        return;
+                    }
+                };
                 if node_guard.is_none() {
+                    let error_msg = "No node available for reconnection".to_string();
+                    println!("{}", error_msg);
+                    if let Ok(mut logs) = logs_shared.lock() {
+                        logs.push(error_msg);
+                    }
+                    if let Ok(mut status) = status_shared.lock() {
+                        *status = "Error: No node running".to_string();
+                    }
+                    ctx_clone.request_repaint();
                     return;
                 }
                 let node = node_guard.as_ref().unwrap();
@@ -1338,34 +1429,74 @@ impl P2PTransfer {
         use wasm_bindgen::JsCast;
         use web_sys::{Blob, BlobPropertyBag, Url, HtmlAnchorElement};
 
-        if let Some(window) = web_sys::window() {
-            if let Some(document) = window.document() {
-                // Create a Blob from the file data
-                let array = js_sys::Uint8Array::new_with_length(file_data.len() as u32);
-                array.copy_from(file_data);
-
-                let parts = js_sys::Array::new();
-                parts.push(&array);
-
-                let mut blob_props = BlobPropertyBag::new();
-                blob_props.type_("application/octet-stream");
-
-                if let Ok(blob) = Blob::new_with_u8_array_sequence_and_options(&parts, &blob_props) {
-                    if let Ok(url) = Url::create_object_url_with_blob(&blob) {
-                        // Create a temporary anchor element and trigger download
-                        if let Ok(anchor) = document.create_element("a") {
-                            let anchor: HtmlAnchorElement = anchor.dyn_into().unwrap();
-                            anchor.set_href(&url);
-                            anchor.set_download(file_name);
-                            anchor.click();
-
-                            // Clean up
-                            let _ = Url::revoke_object_url(&url);
-                        }
-                    }
-                }
+        let window = match web_sys::window() {
+            Some(w) => w,
+            None => {
+                web_sys::console::error_1(&"Failed to get window object".into());
+                return;
             }
-        }
+        };
+
+        let document = match window.document() {
+            Some(d) => d,
+            None => {
+                web_sys::console::error_1(&"Failed to get document object".into());
+                return;
+            }
+        };
+
+        // Create a Blob from the file data
+        let array = js_sys::Uint8Array::new_with_length(file_data.len() as u32);
+        array.copy_from(file_data);
+
+        let parts = js_sys::Array::new();
+        parts.push(&array);
+
+        let mut blob_props = BlobPropertyBag::new();
+        blob_props.type_("application/octet-stream");
+
+        let blob = match Blob::new_with_u8_array_sequence_and_options(&parts, &blob_props) {
+            Ok(b) => b,
+            Err(_e) => {
+                web_sys::console::error_1(&format!("Failed to create blob: {:?}", _e).into());
+                return;
+            }
+        };
+
+        let url = match Url::create_object_url_with_blob(&blob) {
+            Ok(u) => u,
+            Err(_e) => {
+                web_sys::console::error_1(&format!("Failed to create object URL: {:?}", _e).into());
+                return;
+            }
+        };
+
+        // Create a temporary anchor element and trigger download
+        let anchor_elem = match document.create_element("a") {
+            Ok(a) => a,
+            Err(_e) => {
+                web_sys::console::error_1(&format!("Failed to create anchor element: {:?}", _e).into());
+                let _ = Url::revoke_object_url(&url);
+                return;
+            }
+        };
+
+        let anchor: HtmlAnchorElement = match anchor_elem.dyn_into() {
+            Ok(a) => a,
+            Err(_e) => {
+                web_sys::console::error_1(&format!("Failed to cast to HtmlAnchorElement: {:?}", _e).into());
+                let _ = Url::revoke_object_url(&url);
+                return;
+            }
+        };
+
+        anchor.set_href(&url);
+        anchor.set_download(file_name);
+        anchor.click();
+
+        // Clean up
+        let _ = Url::revoke_object_url(&url);
+        web_sys::console::log_1(&format!("Download triggered for: {}", file_name).into());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1725,6 +1856,7 @@ impl P2PTransfer {
         }
 
         if let Some(index) = to_remove {
+            // First, remove from shared_files and get the name
             let removed_name = if let Ok(mut files) = self.shared_files.lock() {
                 let removed = files.remove(index);
 
@@ -1738,7 +1870,7 @@ impl P2PTransfer {
                 None
             };
 
-            // Also remove from WASM data storage
+            // Then, remove from WASM data storage (separate lock scope)
             #[cfg(target_arch = "wasm32")]
             if let Some(ref name) = removed_name {
                 if let Ok(mut files_data) = self.shared_files_data.lock() {
@@ -1748,48 +1880,57 @@ impl P2PTransfer {
             }
 
             // If node is running, update its file list directly
+            // Avoid nested locks by getting data first, then updating node
             if should_restart && removed_name.is_some() {
-                let node_files = if let Ok(node_guard) = self.node.lock() {
-                    node_guard.as_ref().map(|node| node.get_shared_files())
+                // Get the updated file list data before locking node
+                #[cfg(target_arch = "wasm32")]
+                let updated_files = if let Ok(files_data) = self.shared_files_data.lock() {
+                    files_data.clone()
                 } else {
-                    None
+                    Vec::new()
                 };
 
-                if let Some(node_files) = node_files {
-                    if let Ok(mut nf) = node_files.lock() {
-                        // Rebuild the file list from shared_files
-                        nf.clear();
+                #[cfg(not(target_arch = "wasm32"))]
+                let updated_files = if let Ok(files) = self.shared_files.lock() {
+                    files.clone()
+                } else {
+                    Vec::new()
+                };
 
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            if let Ok(files_data) = self.shared_files_data.lock() {
-                                for (name, data) in files_data.iter() {
+                // Now lock node and update (no nested locks)
+                if let Ok(node_guard) = self.node.lock() {
+                    if let Some(node) = node_guard.as_ref() {
+                        if let Ok(mut nf) = node.get_shared_files().lock() {
+                            nf.clear();
+
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                for (name, data) in updated_files.iter() {
                                     nf.push((name.clone(), data.clone()));
                                 }
                             }
-                            web_sys::console::log_1(&format!("Updated running node - removed: {}", removed_name.unwrap()).into());
-                        }
 
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            if let Ok(shared) = self.shared_files.lock() {
-                                for (name, path, _size) in shared.iter() {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                // For non-WASM, read files from disk
+                                for (name, path, _size) in updated_files.iter() {
                                     if let Ok(data) = std::fs::read(path) {
                                         nf.push((name.clone(), data));
                                     }
                                 }
-                            }
 
-                            if let Ok(mut logs) = self.terminal_logs.lock() {
-                                logs.push(format!("Updated running node - removed: {}", removed_name.unwrap()));
+                                drop(nf);  // Release the lock before acquiring terminal_logs lock
+                                if let Ok(mut logs) = self.terminal_logs.lock() {
+                                    if let Some(ref name) = removed_name {
+                                        logs.push(format!("Updated running node - removed: {}", name));
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-
-        // Handle start accepting after locks are released
+        }        // Handle start accepting after locks are released
         if should_start_accepting {
             self.start_accepting(ctx);
         }
