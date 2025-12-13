@@ -307,10 +307,12 @@ impl P2PTransfer {
 
             spawn_local(async move {
                 // Read all files from the shared_files_data list
-                let files_to_share: Vec<(String, Vec<u8>)> = if let Ok(files_data) = shared_files_data.lock() {
-                    files_data.clone()
-                } else {
-                    Vec::new()
+                let files_to_share: Vec<(String, Vec<u8>)> = match shared_files_data.lock() {
+                    Ok(files_data) => files_data.clone(),
+                    Err(_e) => {
+                        web_sys::console::error_1(&format!("⚠️ Failed to lock shared_files_data: {:?}. Starting with no files.", _e).into());
+                        Vec::new()
+                    }
                 };
 
                 if files_to_share.is_empty() {
@@ -1410,11 +1412,38 @@ impl P2PTransfer {
 
     fn add_file_to_share(&mut self, _ctx: &egui::Context) {
         let file_info = {
-            let name = self.picked_file_name.lock().ok().and_then(|f| f.clone());
-            let path = self.picked_file_path.lock().ok().and_then(|f| f.clone());
-            let size = self.picked_file_size.lock().ok().and_then(|f| f.clone());
+            let name = match self.picked_file_name.lock() {
+                Ok(guard) => guard.clone(),
+                Err(_e) => {
+                    #[cfg(target_arch = "wasm32")]
+                    web_sys::console::error_1(&format!("Failed to lock picked_file_name: {:?}", _e).into());
+                    None
+                }
+            };
+            let path = match self.picked_file_path.lock() {
+                Ok(guard) => guard.clone(),
+                Err(_e) => {
+                    #[cfg(target_arch = "wasm32")]
+                    web_sys::console::error_1(&format!("Failed to lock picked_file_path: {:?}", _e).into());
+                    None
+                }
+            };
+            let size = match self.picked_file_size.lock() {
+                Ok(guard) => guard.clone(),
+                Err(_e) => {
+                    #[cfg(target_arch = "wasm32")]
+                    web_sys::console::error_1(&format!("Failed to lock picked_file_size: {:?}", _e).into());
+                    None
+                }
+            };
             #[cfg(target_arch = "wasm32")]
-            let data = self.picked_file_data.lock().ok().and_then(|f| f.clone());
+            let data = match self.picked_file_data.lock() {
+                Ok(guard) => guard.clone(),
+                Err(_e) => {
+                    web_sys::console::error_1(&format!("Failed to lock picked_file_data: {:?}", _e).into());
+                    None
+                }
+            };
 
             #[cfg(target_arch = "wasm32")]
             match (name, path, size, data) {
@@ -1434,7 +1463,7 @@ impl P2PTransfer {
         if let Some((name, path, size, data)) = file_info {
             let mut file_added = false;
             if let Ok(mut files) = self.shared_files.lock() {
-                if !files.iter().any(|(_, p, _)| p == &path) {
+                if !files.iter().any(|(n, _, _)| n == &name) {
                     files.push((name.clone(), path.clone(), size));
                     file_added = true;
                 }
